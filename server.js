@@ -1,4 +1,4 @@
-/**
+here/**
  * ═══════════════════════════════════════════════════════
  *  DataFlow Backend — Node.js + Express
  *  Data Delivery: RemaData API
@@ -115,7 +115,7 @@ app.use(express.json());
 
 // ── API Keys (from .env) ──────────────────────────────
 const REMA_API_KEY        = process.env.REMA_API_KEY;        // rd_live_xxxxx
-const PAYSTACK_SECRET_KEY = sk_live_4d0bdda72cdd36b7a536e544b2ad8ecd23cc35dc; 
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY; // sk_live_xxxxx
 const REMA_BASE_URL       = 'https://remadata.com/api';
 
 const remaHeaders = () => ({
@@ -360,4 +360,3 @@ app.listen(PORT, () => {
   console.log(`   Firebase DB:  ${db ? '✅ Connected' : '⚠️  Not connected'}`);
   console.log(`   CORS allowed origins: ${allowedOrigins.join(', ')}\n`);
 });
-
