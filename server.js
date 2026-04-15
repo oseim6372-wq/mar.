@@ -17,37 +17,147 @@ const crypto   = require('crypto');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Middleware ────────────────────────────────────────
-app.use(cors());
-app.use(express.json());
+// ── CORS Configuration (Allow both local and production) ──
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:5500',
+  'http://127.0.0.1:5500',
+  'https://dataflow-admin.netlify.app',
+  'https://yourusername.github.io'
+];
 
-// ── Firebase Admin Init ───────────────────────────────
-// Download your service account key from Firebase Console
-// Project Settings → Service Accounts → Generate new private key
-// Save as serviceAccountKey.json in the same folder
-let db;
-try {
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    databaseURL: process.env.FIREBASE_DB_URL || 'https://stafford-2efd9-default-rtdb.firebaseio.com'
-  });
-  db = admin.database();
-  console.log('✅ Firebase Admin initialized');
-} catch (e) {
-  console.warn('⚠️  Firebase Admin not initialized:', e.message);
-  console.warn('    Place serviceAccountKey.json in this folder to enable Firebase writes.');
-}
+app.use(cors({
+  origin: function(origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      return callback(null, true);
+    } else {
+      console.log('Blocked origin:', origin);
+      return callback(null, true); // Temporarily allow all for testing
+    }
+  },
+  credentials: true
+}));
+
+// ── Webhook needs raw body FIRST (before JSON parser) ──
+app.post('/paystack-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  // Verify signature
+  const hash = crypto
+    .createHmac('sha512', process.env.PAYSTACK_SECRET_KEY)
+    .update(req.body)
+    .digest('hex');
+
+  if (hash !== req.headers['x-paystack-signature']) {
+    console.warn('⚠️  Invalid Paystack webhook signature');
+    return res.status(401).send('Invalid signature');
+  }
+
+  const event = JSON.parse(req.body);
+  console.log('📩 Paystack webhook:', event.event);
+
+  if (event.event === 'charge.success') {
+    const data     = event.data;
+    const ref      = data.reference;
+    const metadata = data.metadata || {};
+
+    // Expected metadata from your store frontend:
+    // { phone, networkType, volumeInMB, orderId, firebaseKey }
+    const { phone, networkType, volumeInMB, orderId, firebaseKey } = metadata;
+
+    if (phone && networkType && volumeInMB) {
+      console.log(`💳 Payment confirmed for ${ref} — auto-delivering data...`);
+
+      try {
+        // Auto-deliver via RemaData
+        const remaRes = await axios.post(`${REMA_BASE_URL}/buy-data`, {
+          ref:   orderId || ref,
+          phone,
+          volumeInMB: parseInt(volumeInMB),
+          networkType
+        }, { headers: remaHeaders() });
+
+        const ok = remaRes.data.status === 'success';
+        const newStatus = ok ? 'completed' : 'paid-failed-delivery';
+
+        // Update Firebase
+        if (db && firebaseKey) {
+          await db.ref(`orders/${firebaseKey}`).update({
+            status:        newStatus,
+            deliveryStatus: ok ? 'delivered' : 'failed',
+            remaReference: remaRes.data.data?.reference || null,
+            updatedAt:     new Date().toISOString()
+          });
+        }
+
+        console.log(`${ok ? '✅' : '❌'} Auto-delivery ${ok ? 'success' : 'failed'} for ${ref}`);
+
+      } catch (err) {
+        console.error('Auto-delivery error:', err.response?.data || err.message);
+        if (db && firebaseKey) {
+          await db.ref(`orders/${firebaseKey}`).update({
+            status:        'paid-failed-delivery',
+            deliveryError: err.message,
+            updatedAt:     new Date().toISOString()
+          }).catch(() => {});
+        }
+      }
+    } else {
+      console.warn('⚠️  Webhook metadata missing delivery fields — manual delivery needed');
+    }
+  }
+
+  res.sendStatus(200);
+});
+
+// ── Regular JSON parser for all other routes ──
+app.use(express.json());
 
 // ── API Keys (from .env) ──────────────────────────────
 const REMA_API_KEY        = process.env.REMA_API_KEY;        // rd_live_xxxxx
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY; // sk_live_xxxxx
+const PAYSTACK_SECRET_KEY = sk_live_4d0bdda72cdd36b7a536e544b2ad8ecd23cc35dc; 
 const REMA_BASE_URL       = 'https://remadata.com/api';
 
 const remaHeaders = () => ({
   'X-API-KEY': REMA_API_KEY,
   'Content-Type': 'application/json'
 });
+
+// ── Firebase Admin Init (WORKS ON RENDER + LOCAL) ───────
+let db;
+try {
+  // Check if running on Render (environment variable) or local (file)
+  let serviceAccount;
+  
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    // Running on Render.com - use environment variable
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    console.log('🔐 Using Firebase credentials from environment variable');
+  } else {
+    // Running locally - use the JSON file
+    try {
+      serviceAccount = require('./serviceAccountKey.json');
+      console.log('📁 Using Firebase credentials from local file');
+    } catch (localErr) {
+      console.warn('⚠️  Local serviceAccountKey.json not found');
+      serviceAccount = null;
+    }
+  }
+  
+  if (serviceAccount) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      databaseURL: process.env.FIREBASE_DB_URL || 'https://stafford-2efd9-default-rtdb.firebaseio.com'
+    });
+    db = admin.database();
+    console.log('✅ Firebase Admin initialized');
+  } else {
+    console.warn('⚠️  Firebase Admin not initialized - no credentials found');
+  }
+} catch (e) {
+  console.warn('⚠️  Firebase Admin initialization error:', e.message);
+  console.warn('    Make sure FIREBASE_SERVICE_ACCOUNT env variable is set on Render');
+}
 
 // ════════════════════════════════════════════════════════
 //  HEALTH CHECK
@@ -56,7 +166,8 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'DataFlow Backend',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    firebase: db ? 'connected' : 'disconnected'
   });
 });
 
@@ -241,85 +352,12 @@ app.get('/rema-order-status/:ref', async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════
-//  PAYSTACK WEBHOOK
-//  POST /paystack-webhook
-//  Automatically triggers data delivery on successful payment
-// ════════════════════════════════════════════════════════
-app.post('/paystack-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  // Verify signature
-  const hash = crypto
-    .createHmac('sha512', PAYSTACK_SECRET_KEY)
-    .update(req.body)
-    .digest('hex');
-
-  if (hash !== req.headers['x-paystack-signature']) {
-    console.warn('⚠️  Invalid Paystack webhook signature');
-    return res.status(401).send('Invalid signature');
-  }
-
-  const event = JSON.parse(req.body);
-  console.log('📩 Paystack webhook:', event.event);
-
-  if (event.event === 'charge.success') {
-    const data     = event.data;
-    const ref      = data.reference;
-    const metadata = data.metadata || {};
-
-    // Expected metadata from your store frontend:
-    // { phone, networkType, volumeInMB, orderId, firebaseKey }
-    const { phone, networkType, volumeInMB, orderId, firebaseKey } = metadata;
-
-    if (phone && networkType && volumeInMB) {
-      console.log(`💳 Payment confirmed for ${ref} — auto-delivering data...`);
-
-      try {
-        // Auto-deliver via RemaData
-        const remaRes = await axios.post(`${REMA_BASE_URL}/buy-data`, {
-          ref:   orderId || ref,
-          phone,
-          volumeInMB: parseInt(volumeInMB),
-          networkType
-        }, { headers: remaHeaders() });
-
-        const ok = remaRes.data.status === 'success';
-        const newStatus = ok ? 'completed' : 'paid-failed-delivery';
-
-        // Update Firebase
-        if (db && firebaseKey) {
-          await db.ref(`orders/${firebaseKey}`).update({
-            status:        newStatus,
-            deliveryStatus: ok ? 'delivered' : 'failed',
-            remaReference: remaRes.data.data?.reference || null,
-            updatedAt:     new Date().toISOString()
-          });
-        }
-
-        console.log(`${ok ? '✅' : '❌'} Auto-delivery ${ok ? 'success' : 'failed'} for ${ref}`);
-
-      } catch (err) {
-        console.error('Auto-delivery error:', err.response?.data || err.message);
-        if (db && firebaseKey) {
-          await db.ref(`orders/${firebaseKey}`).update({
-            status:        'paid-failed-delivery',
-            deliveryError: err.message,
-            updatedAt:     new Date().toISOString()
-          }).catch(() => {});
-        }
-      }
-    } else {
-      console.warn('⚠️  Webhook metadata missing delivery fields — manual delivery needed');
-    }
-  }
-
-  res.sendStatus(200);
-});
-
 // ── Start ─────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀 DataFlow backend running on http://localhost:${PORT}`);
   console.log(`   Rema API Key: ${REMA_API_KEY ? '✅ Set' : '❌ Missing — check .env'}`);
   console.log(`   Paystack Key: ${PAYSTACK_SECRET_KEY ? '✅ Set' : '❌ Missing — check .env'}`);
-  console.log(`   Firebase DB:  ${db ? '✅ Connected' : '⚠️  Not connected'}\n`);
+  console.log(`   Firebase DB:  ${db ? '✅ Connected' : '⚠️  Not connected'}`);
+  console.log(`   CORS allowed origins: ${allowedOrigins.join(', ')}\n`);
 });
-￼Enter
+
