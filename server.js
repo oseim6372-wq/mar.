@@ -27,7 +27,7 @@ app.use(express.json());
 // Save as serviceAccountKey.json in the same folder
 let db;
 try {
-  const serviceAccount = require('./serviceAccountKey.json');
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
     databaseURL: process.env.FIREBASE_DB_URL || 'https://stafford-2efd9-default-rtdb.firebaseio.com'
