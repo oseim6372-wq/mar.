@@ -1,333 +1,323 @@
-/**
- * ═══════════════════════════════════════════════════════
- *  DataFlow Backend — Node.js + Express
- *  Data Delivery: RemaData API
- *  Payment:       Paystack
- *  Database:      Firebase Realtime Database
- * ═══════════════════════════════════════════════════════
- */
-
-require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const admin = require('firebase-admin');
 const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ── CORS Configuration ──
-const allowedOrigins = [
-  'http://localhost:3000',
-  'http://localhost:5500',
-  'http://127.0.0.1:5500',
-  'https://dataflow-admin.netlify.app'
-];
+// ─────────────────────────────────────────────
+//  CONFIGURATION
+// ─────────────────────────────────────────────
+const REMADATA_API_URL = 'https://remadata.com/api';
+const REMADATA_API_KEY  = process.env.REMADATA_API_KEY  || 'rd_live_your_key_here';   // ⚠️ set in Render env vars
+const PAYSTACK_SECRET   = process.env.PAYSTACK_SECRET   || 'sk_live_your_paystack_secret'; // ⚠️ set in Render env vars
+const SELF_URL          = process.env.SELF_URL          || `http://localhost:${PORT}`;
 
-app.use(cors({
-  origin: function(origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      return callback(null, true);
-    } else {
-      console.log('Blocked origin:', origin);
-      return callback(null, true);
-    }
-  },
-  credentials: true
-}));
+// ─────────────────────────────────────────────
+//  MIDDLEWARE
+//  Raw body must be captured BEFORE json() for
+//  Paystack webhook signature verification
+// ─────────────────────────────────────────────
+app.use('/webhook/paystack', express.raw({ type: 'application/json' }));
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// ── API Keys ──
-const REMA_API_KEY = process.env.REMA_API_KEY;
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
-const REMA_BASE_URL = 'https://remadata.com/api';
+// ─────────────────────────────────────────────
+//  BUNDLE SIZE MAP
+//  Maps common MB values so the frontend can
+//  send either a number or a label like "1GB"
+// ─────────────────────────────────────────────
+const BUNDLE_MAP = {
+  '100':   100,
+  '200':   200,
+  '500':   500,
+  '1gb':   1024,  '1024': 1024,
+  '2gb':   2048,  '2048': 2048,
+  '3gb':   3072,  '3072': 3072,
+  '4gb':   4096,  '4096': 4096,
+  '5gb':   5120,  '5120': 5120,
+  '10gb':  10240, '10240': 10240,
+  '15gb':  15360, '15360': 15360,
+  '20gb':  20480, '20480': 20480,
+};
 
-const remaHeaders = () => ({
-  'X-API-KEY': REMA_API_KEY,
-  'Content-Type': 'application/json'
-});
-
-// ── Firebase Admin Init ──
-let db;
-try {
-  let serviceAccount;
-  
-  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    console.log('🔐 Using Firebase credentials from environment variable');
-  } else {
-    try {
-      serviceAccount = require('./serviceAccountKey.json');
-      console.log('📁 Using Firebase credentials from local file');
-    } catch (localErr) {
-      console.warn('⚠️  Local serviceAccountKey.json not found');
-      serviceAccount = null;
-    }
-  }
-  
-  if (serviceAccount) {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      databaseURL: process.env.FIREBASE_DB_URL || 'https://stafford-2efd9-default-rtdb.firebaseio.com'
-    });
-    db = admin.database();
-    console.log('✅ Firebase Admin initialized');
-  } else {
-    console.warn('⚠️  Firebase Admin not initialized - no credentials found');
-  }
-} catch (e) {
-  console.warn('⚠️  Firebase Admin initialization error:', e.message);
+/**
+ * Resolve volumeInMB from whatever the frontend sends.
+ * Accepts: 1024 (number), "1024" (string), "1GB" (label)
+ */
+function resolveVolume(raw) {
+  if (raw === null || raw === undefined) return null;
+  const key = String(raw).toLowerCase().replace(/\s/g, '');
+  if (BUNDLE_MAP[key]) return BUNDLE_MAP[key];
+  const num = Number(raw);
+  if (!isNaN(num) && num > 0) return num;
+  return null;
 }
 
-// ── Webhook (needs raw body BEFORE JSON parser) ──
-app.post('/paystack-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+// ─────────────────────────────────────────────
+//  CORE DELIVERY HELPER
+// ─────────────────────────────────────────────
+async function deliverData(phone, volumeInMB, networkType, reference) {
+  const orderRef = reference || `DF-${Date.now()}`;
+
+  const payload = {
+    ref:         orderRef,
+    phone:       phone,
+    volumeInMB:  Number(volumeInMB),
+    networkType: networkType.toLowerCase(),
+  };
+
+  console.log(`📦 Delivering ${volumeInMB}MB (${networkType}) → ${phone} | Order: ${orderRef}`);
+
+  const response = await axios.post(
+    `${REMADATA_API_URL}/buy-data`,
+    payload,
+    {
+      headers: {
+        'X-API-KEY':     REMADATA_API_KEY,
+        'Content-Type':  'application/json',
+      },
+      timeout: 30000,
+    }
+  );
+
+  console.log(`✅ Delivery success:`, response.data);
+  return { success: true, data: response.data };
+}
+
+// ─────────────────────────────────────────────
+//  ROUTES
+// ─────────────────────────────────────────────
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+// Wallet balance
+app.get('/api/balance', async (req, res) => {
+  try {
+    const r = await axios.get(`${REMADATA_API_URL}/wallet-balance`, {
+      headers: { 'X-API-KEY': REMADATA_API_KEY },
+    });
+    res.json(r.data);
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.response?.data?.message || 'Failed to fetch balance' });
+  }
+});
+
+// Available bundles
+app.get('/api/bundles', async (req, res) => {
+  const { network } = req.query;
+  try {
+    const url = `${REMADATA_API_URL}/bundles${network ? `?network=${network}` : ''}`;
+    const r = await axios.get(url, { headers: { 'X-API-KEY': REMADATA_API_KEY } });
+    res.json(r.data);
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.response?.data?.message || 'Failed to fetch bundles' });
+  }
+});
+
+// Check price
+app.post('/api/check-price', async (req, res) => {
+  const { networkType, volumeInMB } = req.body;
+  const volume = resolveVolume(volumeInMB);
+
+  if (!networkType || !volume) {
+    return res.status(400).json({ status: 'error', message: 'Missing required fields: networkType, volumeInMB' });
+  }
+
+  try {
+    const r = await axios.post(
+      `${REMADATA_API_URL}/get-cost-price`,
+      { networkType, volumeInMB: volume },
+      { headers: { 'X-API-KEY': REMADATA_API_KEY, 'Content-Type': 'application/json' } }
+    );
+    res.json(r.data);
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.response?.data?.message || 'Price check failed' });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  MAIN DELIVERY ENDPOINT  POST /deliver
+//  Called directly by your frontend/admin panel
+// ─────────────────────────────────────────────
+app.post('/deliver', async (req, res) => {
+  let { phone, volumeInMB, networkType, ref, network, capacity, phoneNumber } = req.body;
+
+  // Accept alternate field names from older frontend code
+  phone       = phone       || phoneNumber;
+  networkType = networkType || network;
+
+  // Resolve volume — accepts number, string, or "1GB" label
+  const volume = resolveVolume(volumeInMB || capacity);
+
+  // ── Validation ──
+  if (!phone) {
+    return res.status(400).json({ status: 'error', message: 'Phone number is required' });
+  }
+  if (!volume) {
+    return res.status(400).json({ status: 'error', message: 'volumeInMB is required (e.g. 1024 for 1GB)' });
+  }
+  if (!networkType) {
+    return res.status(400).json({ status: 'error', message: 'networkType is required (mtn, telecel, airteltigo)' });
+  }
+  if (!/^0[0-9]{9}$/.test(phone)) {
+    return res.status(400).json({ status: 'error', message: 'Phone must be 10 digits starting with 0' });
+  }
+  if (!['mtn', 'telecel', 'airteltigo'].includes(networkType.toLowerCase())) {
+    return res.status(400).json({ status: 'error', message: 'networkType must be: mtn, telecel, or airteltigo' });
+  }
+
+  try {
+    const result = await deliverData(phone, volume, networkType, ref);
+    res.json({ status: 'success', message: 'Order placed successfully', data: result.data });
+  } catch (err) {
+    console.error(`❌ POST /deliver error:`, err.response?.data || err.message);
+    res.status(500).json({
+      status:  'error',
+      message: err.response?.data?.message || 'Delivery failed',
+      details: err.response?.data || null,
+    });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  PAYSTACK WEBHOOK  POST /webhook/paystack
+//  Auto-delivers data when payment is confirmed
+//  Set this URL in your Paystack dashboard
+// ─────────────────────────────────────────────
+app.post('/webhook/paystack', async (req, res) => {
+  // 1. Verify signature
   const hash = crypto
-    .createHmac('sha512', PAYSTACK_SECRET_KEY)
+    .createHmac('sha512', PAYSTACK_SECRET)
     .update(req.body)
     .digest('hex');
 
   if (hash !== req.headers['x-paystack-signature']) {
-    console.warn('⚠️  Invalid Paystack webhook signature');
-    return res.status(401).send('Invalid signature');
+    console.warn('⚠️ Paystack webhook: invalid signature');
+    return res.status(401).send('Unauthorized');
   }
 
-  const event = JSON.parse(req.body);
-  console.log('📩 Paystack webhook:', event.event);
-
-  if (event.event === 'charge.success') {
-    const data = event.data;
-    const ref = data.reference;
-    const metadata = data.metadata || {};
-    const { phone, networkType, volumeInMB, orderId, firebaseKey } = metadata;
-
-    if (phone && networkType && volumeInMB) {
-      console.log(`💳 Payment confirmed for ${ref} — auto-delivering data...`);
-
-      try {
-        const remaRes = await axios.post(`${REMA_BASE_URL}/buy-data`, {
-          ref: orderId || ref,
-          phone,
-          volumeInMB: parseInt(volumeInMB),
-          networkType
-        }, { headers: remaHeaders() });
-
-        const ok = remaRes.data.status === 'success';
-        const newStatus = ok ? 'completed' : 'paid-failed-delivery';
-
-        if (db && firebaseKey) {
-          await db.ref(`orders/${firebaseKey}`).update({
-            status: newStatus,
-            deliveryStatus: ok ? 'delivered' : 'failed',
-            remaReference: remaRes.data.data?.reference || null,
-            updatedAt: new Date().toISOString()
-          });
-        }
-
-        console.log(`${ok ? '✅' : '❌'} Auto-delivery ${ok ? 'success' : 'failed'} for ${ref}`);
-      } catch (err) {
-        console.error('Auto-delivery error:', err.response?.data || err.message);
-        if (db && firebaseKey) {
-          await db.ref(`orders/${firebaseKey}`).update({
-            status: 'paid-failed-delivery',
-            deliveryError: err.message,
-            updatedAt: new Date().toISOString()
-          }).catch(() => {});
-        }
-      }
-    }
+  // 2. Parse event
+  let event;
+  try {
+    event = JSON.parse(req.body.toString());
+  } catch {
+    return res.status(400).send('Bad JSON');
   }
 
+  // Acknowledge immediately — Paystack requires fast response
   res.sendStatus(200);
-});
 
-// ── Regular JSON parser ──
-app.use(express.json());
+  // 3. Only handle successful charges
+  if (event.event !== 'charge.success') return;
 
-// ════════════════════════════════════════════════════════
-//  HEALTH CHECK
-// ════════════════════════════════════════════════════════
-app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'DataFlow Backend',
-    timestamp: new Date().toISOString(),
-    firebase: db ? 'connected' : 'disconnected'
-  });
-});
+  const { reference, metadata, amount, customer } = event.data;
 
-// ════════════════════════════════════════════════════════
-//  GET AVAILABLE BUNDLES
-// ════════════════════════════════════════════════════════
-app.get('/bundles', async (req, res) => {
-  try {
-    const { network } = req.query;
-    const url = network ? `${REMA_BASE_URL}/bundles?network=${network}` : `${REMA_BASE_URL}/bundles`;
-    const response = await axios.get(url, { headers: remaHeaders() });
-    res.json({ success: true, data: response.data.data });
-  } catch (err) {
-    console.error('GET /bundles error:', err.response?.data || err.message);
-    res.status(500).json({ success: false, message: err.response?.data?.message || err.message });
-  }
-});
+  // Your frontend must pass these in Paystack metadata when initializing payment:
+  // metadata: { phone, volumeInMB, networkType, orderId }
+  const phone       = metadata?.phone       || metadata?.custom_fields?.find(f => f.variable_name === 'phone')?.value;
+  const volumeInMB  = metadata?.volumeInMB  || metadata?.custom_fields?.find(f => f.variable_name === 'volumeInMB')?.value;
+  const networkType = metadata?.networkType || metadata?.custom_fields?.find(f => f.variable_name === 'networkType')?.value;
+  const orderId     = metadata?.orderId     || reference;
 
-// ════════════════════════════════════════════════════════
-//  CHECK REAL-TIME PRICE
-// ════════════════════════════════════════════════════════
-app.post('/check-price', async (req, res) => {
-  const { networkType, volumeInMB } = req.body;
-  if (!networkType || !volumeInMB) {
-    return res.status(400).json({ success: false, message: 'networkType and volumeInMB are required' });
-  }
-  try {
-    const response = await axios.post(`${REMA_BASE_URL}/get-cost-price`,
-      { networkType, volumeInMB },
-      { headers: remaHeaders() }
-    );
-    res.json({ success: true, ...response.data });
-  } catch (err) {
-    console.error('POST /check-price error:', err.response?.data || err.message);
-    res.status(500).json({ success: false, message: err.response?.data?.message || err.message });
-  }
-});
-
-// ════════════════════════════════════════════════════════
-//  DELIVER DATA
-// ════════════════════════════════════════════════════════
-app.post('/deliver', async (req, res) => {
-  const { firebaseKey, orderId, phone, networkType, volumeInMB, amount } = req.body;
-
-  if (!phone || !networkType || !volumeInMB) {
-    return res.status(400).json({
-      success: false,
-      message: 'phone, networkType, and volumeInMB are required'
-    });
+  if (!phone || !volumeInMB || !networkType) {
+    console.error(`❌ Webhook missing delivery metadata for ref: ${reference}`, metadata);
+    return;
   }
 
-  console.log(`📦 Delivering ${volumeInMB}MB (${networkType}) → ${phone} | Order: ${orderId}`);
+  const volume = resolveVolume(volumeInMB);
+  if (!volume) {
+    console.error(`❌ Webhook: invalid volumeInMB "${volumeInMB}" for ref: ${reference}`);
+    return;
+  }
+
+  console.log(`💳 Payment confirmed: ${amount / 100} GHS | ref: ${reference} | ${phone}`);
 
   try {
-    const remaRes = await axios.post(`${REMA_BASE_URL}/buy-data`, {
-      ref: orderId || `DF_${Date.now()}`,
-      phone,
-      volumeInMB,
-      networkType
-    }, { headers: remaHeaders() });
-
-    const remaData = remaRes.data;
-    console.log('RemaData response:', remaData);
-
-    if (remaData.status === 'success') {
-      if (db && firebaseKey) {
-        await db.ref(`orders/${firebaseKey}`).update({
-          status: 'completed',
-          deliveryStatus: 'delivered',
-          remaReference: remaData.data?.reference || null,
-          remaBalance: remaData.data?.balance || null,
-          updatedAt: new Date().toISOString()
-        });
-        console.log(`✅ Firebase updated for key: ${firebaseKey}`);
-      }
-
-      res.json({
-        success: true,
-        message: 'Data delivered successfully',
-        remaReference: remaData.data?.reference,
-        balance: remaData.data?.balance
-      });
-    } else {
-      if (db && firebaseKey) {
-        await db.ref(`orders/${firebaseKey}`).update({
-          status: 'paid-failed-delivery',
-          deliveryError: remaData.message || 'RemaData rejected order',
-          updatedAt: new Date().toISOString()
-        });
-      }
-      res.json({
-        success: false,
-        message: remaData.message || 'Delivery failed. Wallet refunded by RemaData.'
-      });
-    }
+    await deliverData(phone, volume, networkType, orderId);
+    console.log(`🎉 Auto-delivered after payment: ${reference}`);
   } catch (err) {
-    console.error('POST /deliver error:', err.response?.data || err.message);
-
-    if (db && firebaseKey) {
-      await db.ref(`orders/${firebaseKey}`).update({
-        status: 'paid-failed-delivery',
-        deliveryError: err.message,
-        updatedAt: new Date().toISOString()
-      }).catch(() => {});
-    }
-
-    res.status(500).json({
-      success: false,
-      message: err.response?.data?.message || err.message
-    });
+    console.error(`❌ Auto-delivery failed after payment ${reference}:`, err.response?.data || err.message);
+    // TODO: Save failed deliveries to Firebase for manual retry
   }
 });
 
-// ════════════════════════════════════════════════════════
-//  WALLET BALANCE
-// ════════════════════════════════════════════════════════
-app.get('/wallet-balance', async (req, res) => {
+// Order status
+app.get('/api/order-status/:ref', async (req, res) => {
   try {
-    const response = await axios.get(`${REMA_BASE_URL}/wallet-balance`, {
-      headers: remaHeaders()
+    const r = await axios.get(`${REMADATA_API_URL}/order-status/${req.params.ref}`, {
+      headers: { 'X-API-KEY': REMADATA_API_KEY },
     });
-    const data = response.data;
-    res.json({
-      success: true,
-      balance: data.data?.balance,
-      currency: data.data?.currency || 'GHS',
-      lastTransaction: data.data?.last_transaction_at
-    });
+    res.json(r.data);
   } catch (err) {
-    console.error('GET /wallet-balance error:', err.response?.data || err.message);
-    res.status(500).json({ success: false, message: err.response?.data?.message || err.message });
+    res.status(500).json({ status: 'error', message: err.response?.data?.message || 'Failed to fetch order status' });
   }
 });
 
-// ════════════════════════════════════════════════════════
-//  ORDER HISTORY (from RemaData)
-// ════════════════════════════════════════════════════════
-app.get('/rema-orders', async (req, res) => {
+// Order history with filters
+app.get('/api/orders', async (req, res) => {
+  const { page, limit, status, network, phone } = req.query;
+  const params = new URLSearchParams();
+  if (page)    params.append('page',     page);
+  if (limit)   params.append('per_page', limit);
+  if (status)  params.append('status',   status);
+  if (network) params.append('network',  network);
+  if (phone)   params.append('phone',    phone);
+
   try {
-    const params = new URLSearchParams();
-    ['status', 'network', 'phone', 'start_date', 'end_date', 'page', 'per_page'].forEach(k => {
-      if (req.query[k]) params.append(k, req.query[k]);
-    });
-    const response = await axios.get(`${REMA_BASE_URL}/orders?${params.toString()}`, {
-      headers: remaHeaders()
-    });
-    res.json({ success: true, data: response.data });
+    const url = `${REMADATA_API_URL}/orders${params.toString() ? '?' + params.toString() : ''}`;
+    const r = await axios.get(url, { headers: { 'X-API-KEY': REMADATA_API_KEY } });
+    res.json(r.data);
   } catch (err) {
-    console.error('GET /rema-orders error:', err.response?.data || err.message);
-    res.status(500).json({ success: false, message: err.response?.data?.message || err.message });
+    res.status(500).json({ status: 'error', message: err.response?.data?.message || 'Failed to fetch orders' });
   }
 });
 
-// ════════════════════════════════════════════════════════
-//  CHECK SINGLE REMA ORDER STATUS
-// ════════════════════════════════════════════════════════
-app.get('/rema-order-status/:ref', async (req, res) => {
-  try {
-    const response = await axios.get(`${REMA_BASE_URL}/order-status/${req.params.ref}`, {
-      headers: remaHeaders()
-    });
-    res.json({ success: true, data: response.data });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.response?.data?.message || err.message });
-  }
+// ─────────────────────────────────────────────
+//  ERROR HANDLERS
+// ─────────────────────────────────────────────
+app.use((req, res) => {
+  res.status(404).json({ status: 'error', message: `Route ${req.method} ${req.url} not found` });
 });
 
-// ════════════════════════════════════════════════════════
+app.use((err, req, res, next) => {
+  console.error('Server error:', err);
+  res.status(500).json({ status: 'error', message: 'Internal server error' });
+});
+
+// ─────────────────────────────────────────────
 //  START SERVER
-// ════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n🚀 DataFlow backend running on port ${PORT}`);
-  console.log(`   Rema API Key: ${REMA_API_KEY ? '✅ Set' : '❌ Missing'}`);
-  console.log(`   Paystack Key: ${PAYSTACK_SECRET_KEY ? '✅ Set' : '❌ Missing'}`);
-  console.log(`   Firebase DB:  ${db ? '✅ Connected' : '⚠️ Not connected'}`);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📡 RemaData API: ${REMADATA_API_URL}`);
+  console.log(`🔑 API Key: ${REMADATA_API_KEY !== 'rd_live_your_key_here' ? 'Configured ✅' : 'NOT SET ⚠️'}`);
+  console.log(`💳 Paystack: ${PAYSTACK_SECRET !== 'sk_live_your_paystack_secret' ? 'Configured ✅' : 'NOT SET ⚠️'}`);
+  console.log(`\n📮 Endpoints:`);
+  console.log(`   POST /deliver           → manual delivery`);
+  console.log(`   POST /webhook/paystack  → auto-delivery on payment`);
+  console.log(`   GET  /api/balance       → wallet balance`);
+  console.log(`   GET  /api/bundles       → available bundles`);
+  console.log(`   GET  /api/orders        → order history`);
 });
+
+// ─────────────────────────────────────────────
+//  KEEP-ALIVE PING (prevents Render free spin-down)
+//  Set SELF_URL env var to your Render URL
+//  e.g. https://your-app.onrender.com
+// ─────────────────────────────────────────────
+setInterval(async () => {
+  try {
+    await axios.get(`${SELF_URL}/health`, { timeout: 10000 });
+    console.log(`💓 Keep-alive ping → ${SELF_URL}`);
+  } catch {
+    // silently fail
+  }
+}, 4 * 60 * 1000); // every 4 minutes
 
 module.exports = app;
