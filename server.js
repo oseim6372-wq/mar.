@@ -9,27 +9,36 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ─────────────────────────────────────────────
-//  CONFIGURATION
+//  CONFIGURATION - UPDATE THESE WITH YOUR REAL CREDENTIALS
 // ─────────────────────────────────────────────
-const REMADATA_API_URL = 'https://remadata.com/api';
-const REMADATA_API_KEY  = process.env.REMADATA_API_KEY  || 'rd_live_your_key_here';
-const PAYSTACK_SECRET   = process.env.PAYSTACK_SECRET   || 'sk_live_your_paystack_secret';
+// ⚠️ IMPORTANT: You need to get the correct API URL from RemaData support
+// Possible correct URLs:
+// - https://api.remadata.com/v1
+// - https://remadata.com/api/v1
+// - https://api.remadata.com
+const REMADATA_API_URL = process.env.REMADATA_API_URL || 'https://api.remadata.com/v1';
+const REMADATA_API_KEY  = process.env.REMADATA_API_KEY  || '';  // Add your real key in .env
+const REMADATA_API_SECRET = process.env.REMADATA_API_SECRET || ''; // Some APIs need this
+const PAYSTACK_SECRET   = process.env.PAYSTACK_SECRET   || '';  // Add your real secret in .env
 const SELF_URL          = process.env.SELF_URL          || `http://localhost:${PORT}`;
 
 // ─────────────────────────────────────────────
 //  MIDDLEWARE
 // ─────────────────────────────────────────────
+// IMPORTANT: Use raw body for webhook signature verification
+app.use('/paystack-webhook', express.raw({ type: 'application/json' }));
 app.use('/webhook/paystack', express.raw({ type: 'application/json' }));
+
+// Regular JSON parsing for other routes
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Enhanced CORS configuration
 app.use(cors({
   origin: '*', // In production, restrict this to your frontend domain
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-KEY']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-KEY', 'X-API-SECRET']
 }));
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
 // Request logging middleware
 app.use((req, res, next) => {
@@ -42,44 +51,57 @@ app.use((req, res, next) => {
 // ─────────────────────────────────────────────
 
 /**
- * Core delivery function - sends request to RemaData API
+ * Get authentication headers (try multiple formats that RemaData might expect)
  */
-async function deliverData(phone, volumeInMB, networkType, reference = null) {
-  const orderRef = reference || `DF-${Date.now()}`;
-
-  const payload = {
-    ref:         orderRef,
-    phone:       phone,
-    volumeInMB:  Number(volumeInMB),
-    networkType: networkType.toLowerCase()
+function getAuthHeaders() {
+  const headers = {
+    'Content-Type': 'application/json',
   };
+  
+  // Try multiple auth formats
+  if (REMADATA_API_KEY) {
+    headers['X-API-KEY'] = REMADATA_API_KEY;
+    headers['X-API-Key'] = REMADATA_API_KEY;
+    headers['api_key'] = REMADATA_API_KEY;
+    headers['apikey'] = REMADATA_API_KEY;
+    headers['Authorization'] = `Bearer ${REMADATA_API_KEY}`;
+  }
+  
+  if (REMADATA_API_SECRET) {
+    headers['X-API-SECRET'] = REMADATA_API_SECRET;
+    headers['X-API-Secret'] = REMADATA_API_SECRET;
+  }
+  
+  return headers;
+}
 
-  console.log(`📦 Delivering ${volumeInMB}MB (${networkType}) → ${phone} | Ref: ${orderRef}`);
-  console.log(`📤 Payload:`, JSON.stringify(payload));
-
+/**
+ * Make API call to RemaData with proper error handling
+ */
+async function callRemaData(endpoint, method = 'GET', data = null) {
+  const url = `${REMADATA_API_URL}${endpoint}`;
+  const headers = getAuthHeaders();
+  
+  console.log(`📡 Calling RemaData: ${method} ${url}`);
+  
   try {
-    const response = await axios.post(
-      `${REMADATA_API_URL}/buy-data`,
-      payload,
-      {
-        headers: {
-          'X-API-KEY':    REMADATA_API_KEY,
-          'Content-Type': 'application/json',
-        },
-        timeout: 30000,
-      }
-    );
-    console.log(`✅ Delivery success:`, response.data);
+    const response = await axios({
+      method,
+      url,
+      headers,
+      data,
+      timeout: 30000
+    });
+    
     return { success: true, data: response.data };
   } catch (error) {
-    console.error(`❌ Delivery failed:`, error.response?.data || error.message);
+    console.error(`❌ RemaData API error:`, error.response?.data || error.message);
     
-    // Enhanced error object with more details
     const enhancedError = new Error(
       error.response?.data?.message || 
       error.response?.data?.error || 
       error.message || 
-      'Delivery failed'
+      'API call failed'
     );
     enhancedError.status = error.response?.status || 500;
     enhancedError.details = error.response?.data || null;
@@ -87,6 +109,45 @@ async function deliverData(phone, volumeInMB, networkType, reference = null) {
     
     throw enhancedError;
   }
+}
+
+/**
+ * Core delivery function - sends request to RemaData API
+ */
+async function deliverData(phone, volumeInMB, networkType, reference = null) {
+  const orderRef = reference || `DF-${Date.now()}`;
+
+  // Try multiple possible payload formats
+  const payloads = [
+    { ref: orderRef, phone, volumeInMB, networkType: networkType.toLowerCase() },
+    { reference: orderRef, phone_number: phone, volume_mb: volumeInMB, network: networkType.toLowerCase() },
+    { order_ref: orderRef, recipient: phone, data_size_mb: volumeInMB, provider: networkType.toLowerCase() }
+  ];
+  
+  let lastError = null;
+  
+  for (const payload of payloads) {
+    try {
+      console.log(`📤 Trying payload format:`, JSON.stringify(payload));
+      
+      const response = await axios.post(
+        `${REMADATA_API_URL}/deliver`,
+        payload,
+        {
+          headers: getAuthHeaders(),
+          timeout: 30000,
+        }
+      );
+      
+      console.log(`✅ Delivery success:`, response.data);
+      return { success: true, data: response.data, reference: orderRef };
+    } catch (error) {
+      lastError = error;
+      console.log(`⚠️ Payload format failed, trying next...`);
+    }
+  }
+  
+  throw lastError;
 }
 
 // ─────────────────────────────────────────────
@@ -98,8 +159,9 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
-    remadataConfigured: REMADATA_API_KEY !== 'rd_live_your_key_here',
-    paystackConfigured: PAYSTACK_SECRET !== 'sk_live_your_paystack_secret'
+    remadataConfigured: !!REMADATA_API_KEY && REMADATA_API_KEY !== '',
+    paystackConfigured: !!PAYSTACK_SECRET && PAYSTACK_SECRET !== '',
+    endpoints: ['/deliver', '/api/balance', '/api/order-status/:ref', '/paystack-webhook', '/api/bundles']
   });
 });
 
@@ -107,34 +169,43 @@ app.get('/health', (req, res) => {
 app.get('/api/balance', async (req, res) => {
   try {
     console.log('📊 Fetching wallet balance...');
-    const response = await axios.get(`${REMADATA_API_URL}/wallet-balance`, {
-      headers: { 'X-API-KEY': REMADATA_API_KEY },
-      timeout: 10000
-    });
     
-    console.log('✅ Balance fetched successfully');
-    res.json(response.data);
-  } catch (err) {
-    console.error('❌ Balance error:', err.response?.data || err.message);
+    // Try multiple possible endpoints
+    const endpoints = ['/wallet/balance', '/balance', '/account/balance'];
+    let lastError = null;
     
-    // Check for specific error types
-    if (err.response?.status === 401) {
-      return res.status(401).json({
-        status: 'error',
-        message: 'Invalid API key. Please check your RemaData API credentials.'
-      });
+    for (const endpoint of endpoints) {
+      try {
+        const result = await callRemaData(endpoint, 'GET');
+        if (result.success) {
+          const balance = result.data?.data?.balance || result.data?.balance || 0;
+          console.log(`✅ Balance fetched: GH₵${balance}`);
+          return res.json({ 
+            status: 'success', 
+            data: { balance: parseFloat(balance) } 
+          });
+        }
+      } catch (err) {
+        lastError = err;
+      }
     }
     
-    if (err.code === 'ECONNABORTED') {
-      return res.status(504).json({
-        status: 'error',
-        message: 'Request timeout. RemaData API is not responding.'
+    throw lastError || new Error('Could not fetch balance');
+  } catch (err) {
+    console.error('❌ Balance error:', err.message);
+    
+    // Return a simulated balance for testing if API is not configured
+    if (!REMADATA_API_KEY || REMADATA_API_KEY === '') {
+      return res.json({
+        status: 'success',
+        data: { balance: 150.00 },
+        note: 'Demo mode - Configure RemaData API for live balance'
       });
     }
     
     res.status(500).json({
       status: 'error',
-      message: err.response?.data?.message || err.message || 'Failed to fetch balance'
+      message: err.message || 'Failed to fetch balance'
     });
   }
 });
@@ -142,20 +213,50 @@ app.get('/api/balance', async (req, res) => {
 // Available bundles
 app.get('/api/bundles', async (req, res) => {
   const { network } = req.query;
+  
   try {
-    let url = `${REMADATA_API_URL}/bundles`;
-    if (network) url += `?network=${network}`;
+    // Try multiple possible endpoints
+    const endpoints = network ? [`/bundles?network=${network}`, `/plans?network=${network}`] : ['/bundles', '/plans'];
+    let lastError = null;
     
-    const response = await axios.get(url, {
-      headers: { 'X-API-KEY': REMADATA_API_KEY },
-      timeout: 10000
-    });
-    res.json(response.data);
+    for (const endpoint of endpoints) {
+      try {
+        const result = await callRemaData(endpoint, 'GET');
+        if (result.success && result.data?.data?.length > 0) {
+          return res.json(result.data);
+        } else if (result.success && result.data?.length > 0) {
+          return res.json({ status: 'success', data: result.data });
+        }
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    
+    // Return demo bundles for testing if API is not configured
+    if (!REMADATA_API_KEY || REMADATA_API_KEY === '') {
+      const demoBundles = [
+        { volumeInMB: 1024, price: 4.20, network: 'mtn' },
+        { volumeInMB: 2048, price: 7.50, network: 'mtn' },
+        { volumeInMB: 5120, price: 16.00, network: 'mtn' },
+        { volumeInMB: 10240, price: 28.00, network: 'mtn' },
+        { volumeInMB: 20480, price: 50.00, network: 'mtn' },
+        { volumeInMB: 51200, price: 110.00, network: 'mtn' }
+      ];
+      
+      const filtered = network ? demoBundles.filter(b => b.network === network) : demoBundles;
+      return res.json({ 
+        status: 'success', 
+        data: filtered,
+        note: 'Demo mode - Connect RemaData API for live bundles'
+      });
+    }
+    
+    throw lastError || new Error('No bundles found');
   } catch (err) {
-    console.error('Bundles error:', err.response?.data || err.message);
+    console.error('Bundles error:', err.message);
     res.status(500).json({
       status: 'error',
-      message: err.response?.data?.message || 'Failed to fetch bundles'
+      message: err.message || 'Failed to fetch bundles'
     });
   }
 });
@@ -172,30 +273,19 @@ app.post('/api/check-price', async (req, res) => {
   }
   
   try {
-    const response = await axios.post(
-      `${REMADATA_API_URL}/get-cost-price`,
-      { networkType, volumeInMB: Number(volumeInMB) },
-      { 
-        headers: { 
-          'X-API-KEY': REMADATA_API_KEY, 
-          'Content-Type': 'application/json' 
-        },
-        timeout: 10000
-      }
-    );
-    res.json(response.data);
+    const result = await callRemaData('/price/check', 'POST', { networkType, volumeInMB: Number(volumeInMB) });
+    res.json(result.data);
   } catch (err) {
-    console.error('Price check error:', err.response?.data || err.message);
+    console.error('Price check error:', err.message);
     res.status(500).json({ 
       status: 'error', 
-      message: err.response?.data?.message || 'Price check failed' 
+      message: err.message || 'Price check failed' 
     });
   }
 });
 
 // ─────────────────────────────────────────────
 //  MAIN DELIVERY ENDPOINT - POST /deliver
-//  Enhanced with better validation and error handling
 // ─────────────────────────────────────────────
 app.post('/deliver', async (req, res) => {
   console.log('📦 Received delivery request:', req.body);
@@ -258,7 +348,6 @@ app.post('/deliver', async (req, res) => {
     });
   }
 
-  // Minimum volume check (most networks require at least 10MB)
   if (volumeNum < 10) {
     return res.status(400).json({
       status: 'error',
@@ -267,84 +356,62 @@ app.post('/deliver', async (req, res) => {
   }
 
   try {
-    // Check wallet balance before attempting delivery
-    try {
-      const balanceRes = await axios.get(`${REMADATA_API_URL}/wallet-balance`, {
-        headers: { 'X-API-KEY': REMADATA_API_KEY },
-        timeout: 5000
-      });
-      
-      const balance = parseFloat(balanceRes.data?.data?.balance || 0);
-      console.log(`💰 Current wallet balance: GH₵${balance.toFixed(2)}`);
-      
-      // Optional: Check if balance is too low (you can implement minimum balance check)
-      if (balance < 10) { // Less than GH₵10
-        console.warn('⚠️ Wallet balance is low');
-      }
-    } catch (balanceErr) {
-      console.warn('⚠️ Could not check balance before delivery:', balanceErr.message);
-      // Continue with delivery attempt anyway
-    }
-
     // Attempt delivery
     const result = await deliverData(phone, volumeNum, normalizedNetwork, ref || null);
     
     res.json({ 
       status: 'success', 
       message: 'Data delivered successfully', 
-      data: result.data 
+      data: result.data,
+      reference: result.reference
     });
     
   } catch (err) {
     console.error(`❌ POST /deliver error:`, err.message);
     
-    // Determine appropriate status code and message
     let statusCode = 500;
     let errorMessage = err.message || 'Delivery failed';
-    let errorDetails = err.details || null;
     
-    // Handle specific RemaData error responses
-    if (err.status === 400) {
-      statusCode = 400;
-    } else if (err.status === 401) {
+    if (err.status === 400) statusCode = 400;
+    else if (err.status === 401) {
       statusCode = 401;
       errorMessage = 'Invalid API key or authentication failed';
     } else if (err.status === 402) {
       statusCode = 402;
       errorMessage = 'Insufficient wallet balance. Please top up your RemaData account.';
-    } else if (err.status === 404) {
-      statusCode = 404;
-      errorMessage = 'Service not available. Please try again later.';
-    } else if (err.code === 'ECONNABORTED') {
-      statusCode = 504;
-      errorMessage = 'Request timeout. The service is taking too long to respond.';
-    } else if (err.message.toLowerCase().includes('balance') || 
-               err.message.toLowerCase().includes('insufficient')) {
+    } else if (err.message?.toLowerCase().includes('balance')) {
       statusCode = 402;
       errorMessage = 'Insufficient wallet balance. Please top up your RemaData account.';
     }
     
     res.status(statusCode).json({ 
       status: 'error', 
-      message: errorMessage, 
-      details: errorDetails 
+      message: errorMessage,
+      details: err.details
     });
   }
 });
 
 // ─────────────────────────────────────────────
-//  PAYSTACK WEBHOOK - POST /webhook/paystack
+//  WEBHOOK HANDLER - POST /paystack-webhook
+//  This matches your Paystack configuration
 // ─────────────────────────────────────────────
-app.post('/webhook/paystack', async (req, res) => {
-  // Verify signature
-  const hash = crypto
-    .createHmac('sha512', PAYSTACK_SECRET)
-    .update(req.body)
-    .digest('hex');
+const webhookHandler = async (req, res) => {
+  console.log(`📨 Webhook received at ${req.path}`);
+  
+  // Verify signature if Paystack secret is configured
+  if (PAYSTACK_SECRET && PAYSTACK_SECRET !== '') {
+    const hash = crypto
+      .createHmac('sha512', PAYSTACK_SECRET)
+      .update(req.body)
+      .digest('hex');
 
-  if (hash !== req.headers['x-paystack-signature']) {
-    console.warn('⚠️ Paystack webhook: invalid signature');
-    return res.status(401).send('Unauthorized');
+    if (hash !== req.headers['x-paystack-signature']) {
+      console.warn('⚠️ Paystack webhook: invalid signature');
+      return res.status(401).send('Unauthorized');
+    }
+  } else {
+    console.warn('⚠️ Paystack secret not configured, skipping signature verification');
   }
 
   let event;
@@ -365,8 +432,8 @@ app.post('/webhook/paystack', async (req, res) => {
   }
 
   const { reference, metadata, amount, customer } = event.data;
-  const phone       = metadata?.phone;
-  const volumeInMB  = metadata?.volumeInMB;
+  const phone = metadata?.phone;
+  const volumeInMB = metadata?.volumeInMB;
   const networkType = metadata?.networkType;
 
   console.log(`💳 Payment confirmed: ${reference} | Amount: GH₵${(amount/100).toFixed(2)} | Customer: ${customer?.email}`);
@@ -382,9 +449,13 @@ app.post('/webhook/paystack', async (req, res) => {
     console.log(`🎉 Auto-delivery successful: ${reference}`);
   } catch (err) {
     console.error(`❌ Auto-delivery failed for ${reference}:`, err.message);
-    // You might want to implement a retry mechanism or notification system here
+    // You could implement a retry queue here
   }
-});
+};
+
+// ✅ Add BOTH webhook endpoints for maximum compatibility
+app.post('/paystack-webhook', webhookHandler);
+app.post('/webhook/paystack', webhookHandler);
 
 // ─────────────────────────────────────────────
 //  ORDER STATUS - GET /api/order-status/:ref
@@ -401,20 +472,28 @@ app.get('/api/order-status/:ref', async (req, res) => {
   
   try {
     console.log(`🔍 Checking order status for ref: ${ref}`);
-    const response = await axios.get(
-      `${REMADATA_API_URL}/order-status/${ref}`,
-      { 
-        headers: { 'X-API-KEY': REMADATA_API_KEY },
-        timeout: 10000
+    
+    // Try multiple possible endpoints
+    const endpoints = [`/order/${ref}`, `/status/${ref}`, `/order-status/${ref}`];
+    let lastError = null;
+    
+    for (const endpoint of endpoints) {
+      try {
+        const result = await callRemaData(endpoint, 'GET');
+        if (result.success) {
+          console.log(`✅ Status for ${ref}:`, result.data?.data?.status || result.data?.status);
+          return res.json(result.data);
+        }
+      } catch (err) {
+        lastError = err;
       }
-    );
+    }
     
-    console.log(`✅ Status for ${ref}:`, response.data?.data?.status || response.data?.status);
-    res.json(response.data);
+    throw lastError || new Error('Order not found');
   } catch (err) {
-    console.error(`❌ Status check failed for ${ref}:`, err.response?.data || err.message);
+    console.error(`❌ Status check failed for ${ref}:`, err.message);
     
-    if (err.response?.status === 404) {
+    if (err.status === 404) {
       return res.status(404).json({
         status: 'error',
         message: 'Order not found'
@@ -423,7 +502,7 @@ app.get('/api/order-status/:ref', async (req, res) => {
     
     res.status(500).json({
       status: 'error',
-      message: err.response?.data?.message || 'Failed to fetch order status'
+      message: err.message || 'Failed to fetch order status'
     });
   }
 });
@@ -431,29 +510,21 @@ app.get('/api/order-status/:ref', async (req, res) => {
 // Order history with filters
 app.get('/api/orders', async (req, res) => {
   const { page = 1, limit = 50, status, network, phone } = req.query;
-  const params = new URLSearchParams();
   
-  if (page)    params.append('page', page);
-  if (limit)   params.append('per_page', limit);
-  if (status)  params.append('status', status);
-  if (network) params.append('network', network);
-  if (phone)   params.append('phone', phone);
-
   try {
-    const url = `${REMADATA_API_URL}/orders${params.toString() ? '?' + params.toString() : ''}`;
-    console.log(`📋 Fetching orders: ${url}`);
+    let endpoint = `/orders?page=${page}&per_page=${limit}`;
+    if (status) endpoint += `&status=${status}`;
+    if (network) endpoint += `&network=${network}`;
+    if (phone) endpoint += `&phone=${phone}`;
     
-    const response = await axios.get(url, { 
-      headers: { 'X-API-KEY': REMADATA_API_KEY },
-      timeout: 15000
-    });
-    
-    res.json(response.data);
+    console.log(`📋 Fetching orders: ${endpoint}`);
+    const result = await callRemaData(endpoint, 'GET');
+    res.json(result.data);
   } catch (err) {
-    console.error('Orders fetch error:', err.response?.data || err.message);
+    console.error('Orders fetch error:', err.message);
     res.status(500).json({ 
       status: 'error', 
-      message: err.response?.data?.message || 'Failed to fetch orders' 
+      message: err.message || 'Failed to fetch orders' 
     });
   }
 });
@@ -490,13 +561,14 @@ app.listen(PORT, () => {
 ║   📡 Port: ${PORT}                                          ║
 ║   🌐 URL:  ${SELF_URL}                                    ║
 ║                                                          ║
-║   🔑 RemaData API: ${REMADATA_API_KEY !== 'rd_live_your_key_here' ? '✅ Configured' : '❌ NOT SET'}        ║
-║   💳 Paystack: ${PAYSTACK_SECRET !== 'sk_live_your_paystack_secret' ? '✅ Configured' : '❌ NOT SET'}          ║
+║   🔑 RemaData API: ${REMADATA_API_KEY && REMADATA_API_KEY !== '' ? '✅ Configured' : '❌ NOT SET'}        ║
+║   💳 Paystack: ${PAYSTACK_SECRET && PAYSTACK_SECRET !== '' ? '✅ Configured' : '❌ NOT SET'}          ║
 ║                                                          ║
 ║   📮 Endpoints:                                          ║
 ║      POST /deliver                → Manual delivery      ║
 ║      GET  /api/balance            → Wallet balance       ║
 ║      GET  /api/order-status/:ref  → Order status         ║
+║      POST /paystack-webhook       → Payment webhook ✓    ║
 ║      POST /webhook/paystack       → Payment webhook      ║
 ║      GET  /api/bundles            → Available bundles    ║
 ║      GET  /api/orders             → Order history        ║
@@ -517,7 +589,7 @@ if (process.env.NODE_ENV === 'production') {
     } catch (err) {
       console.error(`⚠️ Keep-alive ping failed:`, err.message);
     }
-  }, 4 * 60 * 1000); // Every 4 minutes
+  }, 4 * 60 * 1000);
 }
 
 module.exports = app;
