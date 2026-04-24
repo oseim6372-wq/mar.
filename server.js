@@ -17,6 +17,69 @@ const PAYSTACK_SECRET   = process.env.PAYSTACK_SECRET   || '';
 const SELF_URL          = process.env.SELF_URL          || `http://localhost:${PORT}`;
 
 // ─────────────────────────────────────────────
+//  PAYSTACK WEBHOOK HANDLER (MOVED UP - BEFORE app.post)
+// ─────────────────────────────────────────────
+
+/**
+ * Shared Paystack webhook handler
+ */
+async function handlePaystackWebhook(req, res) {
+  console.log(`📨 Webhook received at ${req.path}`);
+  
+  // Verify signature
+  if (PAYSTACK_SECRET && PAYSTACK_SECRET !== '') {
+    const hash = crypto
+      .createHmac('sha512', PAYSTACK_SECRET)
+      .update(req.body)
+      .digest('hex');
+
+    if (hash !== req.headers['x-paystack-signature']) {
+      console.warn('⚠️ Paystack webhook: invalid signature');
+      return res.status(401).send('Unauthorized');
+    }
+  } else {
+    console.warn('⚠️ PAYSTACK_SECRET not set in environment variables');
+  }
+
+  let event;
+  try {
+    event = JSON.parse(req.body.toString());
+  } catch (err) {
+    console.error('❌ Failed to parse webhook JSON:', err);
+    return res.status(400).send('Bad JSON');
+  }
+
+  // Respond immediately to Paystack
+  res.sendStatus(200);
+
+  // Process only successful charges
+  if (event.event !== 'charge.success') {
+    console.log(`📝 Webhook event ignored: ${event.event}`);
+    return;
+  }
+
+  const { reference, metadata, amount, customer } = event.data;
+  const phone = metadata?.phone;
+  const volumeInMB = metadata?.volumeInMB;
+  const networkType = metadata?.networkType;
+
+  console.log(`💳 Payment confirmed: ${reference} | Amount: GH₵${(amount/100).toFixed(2)}`);
+
+  if (!phone || !volumeInMB || !networkType) {
+    console.error(`❌ Webhook missing delivery metadata for ref: ${reference}`, { metadata });
+    return;
+  }
+
+  try {
+    console.log(`🚀 Auto-delivering after payment: ${reference}`);
+    const result = await deliverData(phone, Number(volumeInMB), networkType, reference);
+    console.log(`🎉 Auto-delivery successful! RemaData Ref: ${result.remaDataRef}`);
+  } catch (err) {
+    console.error(`❌ Auto-delivery failed for ${reference}:`, err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
 //  MIDDLEWARE
 // ─────────────────────────────────────────────
 app.post('/paystack-webhook', express.raw({ type: 'application/json' }), handlePaystackWebhook);
@@ -97,63 +160,6 @@ async function deliverData(phone, volumeInMB, networkType, reference = null) {
     enhancedError.code = error.code;
     
     throw enhancedError;
-  }
-}
-
-/**
- * Shared Paystack webhook handler
- */
-async function handlePaystackWebhook(req, res) {
-  console.log(`📨 Webhook received at ${req.path}`);
-  
-  // Verify signature
-  if (PAYSTACK_SECRET && PAYSTACK_SECRET !== '') {
-    const hash = crypto
-      .createHmac('sha512', PAYSTACK_SECRET)
-      .update(req.body)
-      .digest('hex');
-
-    if (hash !== req.headers['x-paystack-signature']) {
-      console.warn('⚠️ Paystack webhook: invalid signature');
-      return res.status(401).send('Unauthorized');
-    }
-  }
-
-  let event;
-  try {
-    event = JSON.parse(req.body.toString());
-  } catch (err) {
-    console.error('❌ Failed to parse webhook JSON:', err);
-    return res.status(400).send('Bad JSON');
-  }
-
-  // Respond immediately to Paystack
-  res.sendStatus(200);
-
-  // Process only successful charges
-  if (event.event !== 'charge.success') {
-    console.log(`📝 Webhook event ignored: ${event.event}`);
-    return;
-  }
-
-  const { reference, metadata, amount, customer } = event.data;
-  const phone = metadata?.phone;
-  const volumeInMB = metadata?.volumeInMB;
-  const networkType = metadata?.networkType;
-
-  console.log(`💳 Payment confirmed: ${reference} | Amount: GH₵${(amount/100).toFixed(2)}`);
-
-  if (!phone || !volumeInMB || !networkType) {
-    console.error(`❌ Webhook missing delivery metadata for ref: ${reference}`, { metadata });
-    return;
-  }
-
-  try {
-    console.log(`🚀 Auto-delivering after payment: ${reference}`);
-    const result = await deliverData(phone, Number(volumeInMB), networkType, reference);
-    console.log(`🎉 Auto-delivery successful! RemaData Ref: ${result.remaDataRef}`);
-  } catch (err) {
-    console.error(`❌ Auto-delivery failed for ${reference}:`, err.message);
   }
 }
 
