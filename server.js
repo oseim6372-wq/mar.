@@ -1,3 +1,6 @@
+
+
+
 require('dotenv').config();
 
 const express = require('express');
@@ -15,123 +18,11 @@ const REMADATA_API_URL = 'https://remadata.com/api';
 const REMADATA_API_KEY  = process.env.REMADATA_API_KEY  || '';
 const PAYSTACK_SECRET   = process.env.PAYSTACK_SECRET   || '';
 const SELF_URL          = process.env.SELF_URL          || `http://localhost:${PORT}`;
+const DELIVER_SECRET    = process.env.DELIVER_SECRET    || '';
 
-// ─────────────────────────────────────────────
-//  PAYSTACK WEBHOOK HANDLER (UPDATED - MANDATORY VERIFICATION)
-// ─────────────────────────────────────────────
-
-/**
- * Verify transaction with Paystack API
- * This prevents fake webhook attacks
- */
-async function verifyTransactionWithPaystack(reference) {
-  if (!PAYSTACK_SECRET || PAYSTACK_SECRET === '') {
-    console.error('❌ PAYSTACK_SECRET not configured - cannot verify transaction');
-    return false;
-  }
-
-  try {
-    const response = await axios.get(
-      `https://api.paystack.co/transaction/verify/${reference}`,
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET}`
-        },
-        timeout: 10000
-      }
-    );
-    
-    const transaction = response.data.data;
-    
-    // Check if transaction is really successful
-    if (transaction.status !== 'success') {
-      console.warn(`⚠️ Transaction ${reference} status is: ${transaction.status}`);
-      return false;
-    }
-    
-    console.log(`✅ Transaction verified: ${reference} | Amount: ${transaction.amount/100} ${transaction.currency}`);
-    return true;
-    
-  } catch (error) {
-    console.error(`❌ Paystack verification failed for ${reference}:`, error.response?.data || error.message);
-    return false;
-  }
-}
-
-/**
- * Shared Paystack webhook handler
- * NOW WITH MANDATORY VERIFICATION
- */
-async function handlePaystackWebhook(req, res) {
-  console.log(`📨 Webhook received at ${req.path}`);
-  
-  // ✅ MANDATORY signature verification - NO EXCEPTIONS
-  if (!PAYSTACK_SECRET || PAYSTACK_SECRET === '') {
-    console.error('❌ PAYSTACK_SECRET not set - cannot verify webhook');
-    return res.status(500).send('Configuration error');
-  }
-  
-  const hash = crypto
-    .createHmac('sha512', PAYSTACK_SECRET)
-    .update(req.body)
-    .digest('hex');
-
-  if (hash !== req.headers['x-paystack-signature']) {
-    console.warn('⚠️ Paystack webhook: invalid signature - REJECTED');
-    console.warn(`   Expected: ${hash}`);
-    console.warn(`   Received: ${req.headers['x-paystack-signature']}`);
-    return res.status(401).send('Unauthorized');
-  }
-
-  console.log('✅ Signature verified successfully');
-
-  let event;
-  try {
-    event = JSON.parse(req.body.toString());
-  } catch (err) {
-    console.error('❌ Failed to parse webhook JSON:', err);
-    return res.status(400).send('Bad JSON');
-  }
-
-  // Respond immediately to Paystack
-  res.sendStatus(200);
-
-  // Process only successful charges
-  if (event.event !== 'charge.success') {
-    console.log(`📝 Webhook event ignored: ${event.event}`);
-    return;
-  }
-
-  const { reference, metadata, amount, customer } = event.data;
-  const phone = metadata?.phone;
-  const volumeInMB = metadata?.volumeInMB;
-  const networkType = metadata?.networkType;
-
-  console.log(`💰 Payment received: ${reference} | Amount: GH₵${(amount/100).toFixed(2)}`);
-
-  // ✅ ADDITIONAL SECURITY: Verify with Paystack API before delivering
-  console.log(`🔍 Verifying transaction with Paystack API...`);
-  const isValid = await verifyTransactionWithPaystack(reference);
-  
-  if (!isValid) {
-    console.error(`🚨 FAKE TRANSACTION DETECTED: ${reference} - NO DATA DELIVERED`);
-    // Log to separate file or monitoring system
-    return; // Do NOT deliver data
-  }
-
-  if (!phone || !volumeInMB || !networkType) {
-    console.error(`❌ Webhook missing delivery metadata for ref: ${reference}`, { metadata });
-    return;
-  }
-
-  try {
-    console.log(`🚀 Auto-delivering after verified payment: ${reference}`);
-    const result = await deliverData(phone, Number(volumeInMB), networkType, reference);
-    console.log(`🎉 Auto-delivery successful! RemaData Ref: ${result.remaDataRef}`);
-  } catch (err) {
-    console.error(`❌ Auto-delivery failed for ${reference}:`, err.message);
-  }
-}
+// In-memory dedup set (resets on server restart)
+// For production persistence, use Firebase (see handlePaystackWebhook comments)
+const processedRefs = new Set();
 
 // ─────────────────────────────────────────────
 //  MIDDLEWARE
@@ -147,6 +38,27 @@ app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
   next();
 });
+
+// ─────────────────────────────────────────────
+//  AUTH MIDDLEWARE
+// ─────────────────────────────────────────────
+
+/**
+ * Protects /deliver from unauthorized direct calls.
+ * Requires X-API-KEY header matching DELIVER_SECRET env variable.
+ */
+function requireApiKey(req, res, next) {
+  if (!DELIVER_SECRET) {
+    console.warn('⚠️ DELIVER_SECRET not configured — /deliver is unprotected!');
+    return res.status(500).json({ status: 'error', message: 'Server misconfiguration: DELIVER_SECRET not set' });
+  }
+  const key = req.headers['x-api-key'] || req.body?.apiKey;
+  if (!key || key !== DELIVER_SECRET) {
+    console.warn(`🚫 Unauthorized /deliver attempt from ${req.ip}`);
+    return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+  }
+  next();
+}
 
 // ─────────────────────────────────────────────
 //  HELPER FUNCTIONS
@@ -191,29 +103,151 @@ async function deliverData(phone, volumeInMB, networkType, reference = null) {
       }
     );
     console.log(`✅ Delivery success:`, response.data);
-    
+
     // ✅ Extract and return the RemaData reference for tracking
     const remaReference = response.data?.data?.reference || response.data?.reference || orderRef;
-    
-    return { 
-      success: true, 
+
+    return {
+      success: true,
       data: response.data,
       remaDataRef: remaReference  // CRITICAL: Save this for status checks
     };
   } catch (error) {
     console.error(`❌ Delivery failed:`, error.response?.data || error.message);
-    
+
     const enhancedError = new Error(
-      error.response?.data?.message || 
-      error.response?.data?.error || 
-      error.message || 
+      error.response?.data?.message ||
+      error.response?.data?.error ||
+      error.message ||
       'Delivery failed'
     );
     enhancedError.status = error.response?.status || 500;
     enhancedError.details = error.response?.data || null;
     enhancedError.code = error.code;
-    
+
     throw enhancedError;
+  }
+}
+
+/**
+ * Shared Paystack webhook handler
+ * ✅ SECURITY: Signature verification + Paystack API verification + duplicate prevention
+ */
+async function handlePaystackWebhook(req, res) {
+  console.log(`📨 Webhook received at ${req.path}`);
+
+  // 1. Reject if Paystack secret is not configured
+  if (!PAYSTACK_SECRET) {
+    console.warn('⚠️ No Paystack secret configured — rejecting webhook');
+    return res.status(401).send('Unauthorized');
+  }
+
+  // 2. Verify HMAC signature using raw body
+  const hash = crypto
+    .createHmac('sha512', PAYSTACK_SECRET)
+    .update(req.body)
+    .digest('hex');
+
+  if (hash !== req.headers['x-paystack-signature']) {
+    console.warn('⚠️ Paystack webhook: invalid signature — rejected');
+    return res.status(401).send('Unauthorized');
+  }
+  console.log(`✅ Signature verified successfully`);
+
+  // 3. Parse event JSON
+  let event;
+  try {
+    event = JSON.parse(req.body.toString());
+  } catch (err) {
+    console.error('❌ Failed to parse webhook JSON:', err);
+    return res.status(400).send('Bad JSON');
+  }
+
+  // 4. Respond immediately to Paystack (must respond within 5s)
+  res.sendStatus(200);
+
+  // 5. Only process successful charges
+  if (event.event !== 'charge.success') {
+    console.log(`📝 Webhook event ignored: ${event.event}`);
+    return;
+  }
+
+  const { reference, metadata, amount } = event.data;
+
+  // 6. Duplicate reference check (prevents replay attacks)
+  if (processedRefs.has(reference)) {
+    console.warn(`⚠️ Duplicate webhook ignored for ref: ${reference}`);
+    return;
+  }
+
+  // 7. ✅ CRITICAL: Verify transaction directly with Paystack API
+  //    This confirms the transaction is REAL and not forged/replayed
+  let txData;
+  try {
+    console.log(`🔍 Verifying transaction with Paystack API...`);
+    const verifyRes = await axios.get(
+      `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
+      {
+        headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` },
+        timeout: 15000,
+      }
+    );
+
+    txData = verifyRes.data?.data;
+
+    if (!txData || txData.status !== 'success') {
+      console.warn(`⚠️ Paystack API verification failed for ${reference}: status=${txData?.status}`);
+      return;
+    }
+
+    // 8. Reject test-mode transactions in production environment
+    if (process.env.NODE_ENV === 'production' && txData.domain === 'test') {
+      console.warn(`⚠️ Test-mode transaction rejected in production: ${reference}`);
+      return;
+    }
+
+    // 9. Verify the amount matches what Paystack actually charged
+    if (txData.amount !== amount) {
+      console.error(`🚨 AMOUNT MISMATCH - FAKE TRANSACTION DETECTED!`);
+      console.error(`   Transaction ${reference} actual amount: ${(txData.amount / 100).toFixed(2)} GHS`);
+      console.error(`   Webhook claimed amount: ${(amount / 100).toFixed(2)} GHS`);
+      return; // Do NOT deliver - this is a fake webhook
+    }
+
+    console.log(`✅ Transaction verified: ${reference} | Amount: ${(txData.amount / 100).toFixed(2)} GHS`);
+    console.log(`✅ Amount verified: ${(txData.amount / 100).toFixed(2)} GHS matches webhook`);
+
+  } catch (err) {
+    console.error(`❌ Paystack API verification error for ${reference}:`, err.response?.data || err.message);
+    return; // Do NOT deliver if we cannot verify with Paystack
+  }
+
+  // 10. Mark reference as processed BEFORE delivery to prevent race conditions
+  processedRefs.add(reference);
+
+  // 11. Extract delivery metadata
+  const phone = metadata?.phone;
+  const volumeInMB = metadata?.volumeInMB;
+  const networkType = metadata?.networkType;
+
+  console.log(`💰 Payment received: ${reference} | Amount: GH₵${(amount / 100).toFixed(2)}`);
+
+  if (!phone || !volumeInMB || !networkType) {
+    console.error(`❌ Webhook missing delivery metadata for ref: ${reference}`, { metadata });
+    // Remove from set so it can be retried manually if needed
+    processedRefs.delete(reference);
+    return;
+  }
+
+  // 12. Deliver data
+  try {
+    console.log(`🚀 Auto-delivering after verified payment: ${reference}`);
+    const result = await deliverData(phone, Number(volumeInMB), networkType, reference);
+    console.log(`🎉 Auto-delivery successful! RemaData Ref: ${result.remaDataRef}`);
+  } catch (err) {
+    console.error(`❌ Auto-delivery failed for ${reference}:`, err.message);
+    // Remove from processedRefs so a manual retry is still possible
+    processedRefs.delete(reference);
   }
 }
 
@@ -223,11 +257,12 @@ async function deliverData(phone, volumeInMB, networkType, reference = null) {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
+  res.json({
+    status: 'OK',
     timestamp: new Date().toISOString(),
     remadataConfigured: !!REMADATA_API_KEY && REMADATA_API_KEY !== '',
     paystackConfigured: !!PAYSTACK_SECRET && PAYSTACK_SECRET !== '',
+    deliverProtected:   !!DELIVER_SECRET  && DELIVER_SECRET  !== '',
     endpoints: ['/deliver', '/api/balance', '/api/order-status/:ref', '/paystack-webhook', '/api/bundles', '/api/orders']
   });
 });
@@ -270,7 +305,7 @@ app.post('/api/check-price', async (req, res) => {
     return res.status(400).json({ status: 'error', message: 'Missing required fields' });
   }
   try {
-    const response = await axios.post(`${REMADATA_API_URL}/get-cost-price`, 
+    const response = await axios.post(`${REMADATA_API_URL}/get-cost-price`,
       { networkType, volumeInMB: Number(volumeInMB) },
       { headers: { 'X-API-KEY': REMADATA_API_KEY, 'Content-Type': 'application/json' }, timeout: 10000 }
     );
@@ -280,10 +315,10 @@ app.post('/api/check-price', async (req, res) => {
   }
 });
 
-// ✅ MAIN DELIVERY ENDPOINT - Returns RemaData reference
-app.post('/deliver', async (req, res) => {
+// ✅ MAIN DELIVERY ENDPOINT - Protected by API key
+app.post('/deliver', requireApiKey, async (req, res) => {
   console.log('📦 Received delivery request:', req.body);
-  
+
   let { phone, volumeInMB, networkType, ref } = req.body;
 
   if (!phone || !volumeInMB || !networkType) {
@@ -310,11 +345,11 @@ app.post('/deliver', async (req, res) => {
 
   try {
     const result = await deliverData(phone, volumeNum, normalizedNetwork, ref || null);
-    
+
     // ✅ Return the RemaData reference to the frontend
-    res.json({ 
-      status: 'success', 
-      message: 'Data delivered successfully', 
+    res.json({
+      status: 'success',
+      message: 'Data delivered successfully',
       data: result.data,
       reference: result.remaDataRef  // CRITICAL: For frontend to store
     });
@@ -330,35 +365,34 @@ app.post('/deliver', async (req, res) => {
 // ✅ ORDER STATUS - Uses RemaData's correct endpoint
 app.get('/api/order-status/:ref', async (req, res) => {
   const { ref } = req.params;
-  
+
   if (!ref) {
     return res.status(400).json({ status: 'error', message: 'Reference is required' });
   }
-  
+
   try {
     console.log(`🔍 Checking order status for ref: ${ref}`);
-    
-    // ✅ Correct RemaData endpoint as per docs: /api/order-status/{reference}
+
     const response = await axios.get(
       `${REMADATA_API_URL}/order-status/${encodeURIComponent(ref)}`,
-      { 
+      {
         headers: { 'X-API-KEY': REMADATA_API_KEY },
         timeout: 10000
       }
     );
-    
+
     console.log(`✅ Status for ${ref}:`, response.data?.data?.status || response.data?.status);
     res.json(response.data);
   } catch (err) {
     console.error(`❌ Status check failed for ${ref}:`, err.response?.data || err.message);
-    
+
     if (err.response?.status === 404) {
-      return res.status(404).json({ 
-        status: 'error', 
-        message: 'Order not found. The delivery may not have been initiated yet.' 
+      return res.status(404).json({
+        status: 'error',
+        message: 'Order not found. The delivery may not have been initiated yet.'
       });
     }
-    
+
     res.status(500).json({
       status: 'error',
       message: err.response?.data?.message || 'Failed to fetch order status'
@@ -381,7 +415,7 @@ app.get('/api/orders', async (req, res) => {
 
   try {
     const url = `${REMADATA_API_URL}/orders${params.toString() ? '?' + params.toString() : ''}`;
-    const response = await axios.get(url, { 
+    const response = await axios.get(url, {
       headers: { 'X-API-KEY': REMADATA_API_KEY },
       timeout: 15000
     });
@@ -413,11 +447,11 @@ app.listen(PORT, () => {
 ║   📡 Port: ${PORT}                                          ║
 ║   🌐 URL:  ${SELF_URL}                                    ║
 ║   🔑 RemaData API: ${REMADATA_API_KEY ? '✅ Configured' : '❌ NOT SET'}        ║
-║   💳 Paystack: ${PAYSTACK_SECRET ? '✅ Configured' : '❌ NOT SET'}          ║
-║   🔒 Webhook Security: MANDATORY signature + API verification ║
+║   💳 Paystack:     ${PAYSTACK_SECRET  ? '✅ Configured' : '❌ NOT SET'}          ║
+║   🔒 /deliver key: ${DELIVER_SECRET   ? '✅ Configured' : '❌ NOT SET'}          ║
 ║                                                          ║
 ║   📮 Endpoints:                                          ║
-║      POST /deliver                → Manual delivery      ║
+║      POST /deliver                → Manual delivery 🔒   ║
 ║      GET  /api/balance            → Wallet balance       ║
 ║      GET  /api/order-status/:ref  → Order status ✓       ║
 ║      POST /paystack-webhook       → Payment webhook      ║
