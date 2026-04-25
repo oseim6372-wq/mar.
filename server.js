@@ -17,29 +17,73 @@ const PAYSTACK_SECRET   = process.env.PAYSTACK_SECRET   || '';
 const SELF_URL          = process.env.SELF_URL          || `http://localhost:${PORT}`;
 
 // ─────────────────────────────────────────────
-//  PAYSTACK WEBHOOK HANDLER (MOVED UP - BEFORE app.post)
+//  PAYSTACK WEBHOOK HANDLER (UPDATED - MANDATORY VERIFICATION)
 // ─────────────────────────────────────────────
 
 /**
+ * Verify transaction with Paystack API
+ * This prevents fake webhook attacks
+ */
+async function verifyTransactionWithPaystack(reference) {
+  if (!PAYSTACK_SECRET || PAYSTACK_SECRET === '') {
+    console.error('❌ PAYSTACK_SECRET not configured - cannot verify transaction');
+    return false;
+  }
+
+  try {
+    const response = await axios.get(
+      `https://api.paystack.co/transaction/verify/${reference}`,
+      {
+        headers: {
+          Authorization: `Bearer ${PAYSTACK_SECRET}`
+        },
+        timeout: 10000
+      }
+    );
+    
+    const transaction = response.data.data;
+    
+    // Check if transaction is really successful
+    if (transaction.status !== 'success') {
+      console.warn(`⚠️ Transaction ${reference} status is: ${transaction.status}`);
+      return false;
+    }
+    
+    console.log(`✅ Transaction verified: ${reference} | Amount: ${transaction.amount/100} ${transaction.currency}`);
+    return true;
+    
+  } catch (error) {
+    console.error(`❌ Paystack verification failed for ${reference}:`, error.response?.data || error.message);
+    return false;
+  }
+}
+
+/**
  * Shared Paystack webhook handler
+ * NOW WITH MANDATORY VERIFICATION
  */
 async function handlePaystackWebhook(req, res) {
   console.log(`📨 Webhook received at ${req.path}`);
   
-  // Verify signature
-  if (PAYSTACK_SECRET && PAYSTACK_SECRET !== '') {
-    const hash = crypto
-      .createHmac('sha512', PAYSTACK_SECRET)
-      .update(req.body)
-      .digest('hex');
-
-    if (hash !== req.headers['x-paystack-signature']) {
-      console.warn('⚠️ Paystack webhook: invalid signature');
-      return res.status(401).send('Unauthorized');
-    }
-  } else {
-    console.warn('⚠️ PAYSTACK_SECRET not set in environment variables');
+  // ✅ MANDATORY signature verification - NO EXCEPTIONS
+  if (!PAYSTACK_SECRET || PAYSTACK_SECRET === '') {
+    console.error('❌ PAYSTACK_SECRET not set - cannot verify webhook');
+    return res.status(500).send('Configuration error');
   }
+  
+  const hash = crypto
+    .createHmac('sha512', PAYSTACK_SECRET)
+    .update(req.body)
+    .digest('hex');
+
+  if (hash !== req.headers['x-paystack-signature']) {
+    console.warn('⚠️ Paystack webhook: invalid signature - REJECTED');
+    console.warn(`   Expected: ${hash}`);
+    console.warn(`   Received: ${req.headers['x-paystack-signature']}`);
+    return res.status(401).send('Unauthorized');
+  }
+
+  console.log('✅ Signature verified successfully');
 
   let event;
   try {
@@ -63,7 +107,17 @@ async function handlePaystackWebhook(req, res) {
   const volumeInMB = metadata?.volumeInMB;
   const networkType = metadata?.networkType;
 
-  console.log(`💳 Payment confirmed: ${reference} | Amount: GH₵${(amount/100).toFixed(2)}`);
+  console.log(`💰 Payment received: ${reference} | Amount: GH₵${(amount/100).toFixed(2)}`);
+
+  // ✅ ADDITIONAL SECURITY: Verify with Paystack API before delivering
+  console.log(`🔍 Verifying transaction with Paystack API...`);
+  const isValid = await verifyTransactionWithPaystack(reference);
+  
+  if (!isValid) {
+    console.error(`🚨 FAKE TRANSACTION DETECTED: ${reference} - NO DATA DELIVERED`);
+    // Log to separate file or monitoring system
+    return; // Do NOT deliver data
+  }
 
   if (!phone || !volumeInMB || !networkType) {
     console.error(`❌ Webhook missing delivery metadata for ref: ${reference}`, { metadata });
@@ -71,7 +125,7 @@ async function handlePaystackWebhook(req, res) {
   }
 
   try {
-    console.log(`🚀 Auto-delivering after payment: ${reference}`);
+    console.log(`🚀 Auto-delivering after verified payment: ${reference}`);
     const result = await deliverData(phone, Number(volumeInMB), networkType, reference);
     console.log(`🎉 Auto-delivery successful! RemaData Ref: ${result.remaDataRef}`);
   } catch (err) {
@@ -360,6 +414,7 @@ app.listen(PORT, () => {
 ║   🌐 URL:  ${SELF_URL}                                    ║
 ║   🔑 RemaData API: ${REMADATA_API_KEY ? '✅ Configured' : '❌ NOT SET'}        ║
 ║   💳 Paystack: ${PAYSTACK_SECRET ? '✅ Configured' : '❌ NOT SET'}          ║
+║   🔒 Webhook Security: MANDATORY signature + API verification ║
 ║                                                          ║
 ║   📮 Endpoints:                                          ║
 ║      POST /deliver                → Manual delivery      ║
