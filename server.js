@@ -39,6 +39,9 @@ const REMADATA_TOKEN       = process.env.REMADATA_TOKEN        || '';
 const REMADATA_SENDER      = process.env.REMADATA_SENDER       || '';
 const MTN_CONSUMER_KEY     = process.env.MTN_CONSUMER_KEY      || '';
 const MTN_CONSUMER_SECRET  = process.env.MTN_CONSUMER_SECRET   || '';
+// Docs: https://api.mtn.com/v1/oauth/access_token?grant_type=client_credentials
+// YAML: https://api.mtn.com/oauth/client_credential/accesstoken?grant_type=client_credentials
+// Using docs URL (v1 path) — change to YAML path if this 400s again
 const MTN_OAUTH_URL        = 'https://api.mtn.com/v1/oauth/access_token';
 const MTN_KYC_BASE         = 'https://api.mtn.com/v1/customers';
 const FIREBASE_DB_URL      = process.env.FIREBASE_DATABASE_URL || '';
@@ -85,15 +88,33 @@ async function getMtnAccessToken() {
     throw new Error('MTN_CONSUMER_KEY or MTN_CONSUMER_SECRET not configured');
   }
   console.log('🔑 Fetching new MTN OAuth token…');
-  const params = new URLSearchParams();
-  params.append('grant_type',    'client_credentials');
-  params.append('client_id',     MTN_CONSUMER_KEY);
-  params.append('client_secret', MTN_CONSUMER_SECRET);
 
-  const response = await axios.post(MTN_OAUTH_URL, params.toString(), {
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    timeout: 15000
-  });
+  // Matches docs curl exactly:
+  // POST /v1/oauth/access_token?grant_type=client_credentials
+  // Body: client_id={key}&client_secret={secret}
+  const body = new URLSearchParams();
+  body.append('client_id',     MTN_CONSUMER_KEY);
+  body.append('client_secret', MTN_CONSUMER_SECRET);
+
+  let response;
+  try {
+    response = await axios.post(
+      `${MTN_OAUTH_URL}?grant_type=client_credentials`,
+      body.toString(),
+      {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: 15000
+      }
+    );
+  } catch (err) {
+    // Log full MTN error so we can debug from Render logs
+    console.error('❌ MTN token request failed:');
+    console.error('   Status :', err.response?.status);
+    console.error('   Body   :', JSON.stringify(err.response?.data));
+    console.error('   URL    :', MTN_OAUTH_URL + '?grant_type=client_credentials');
+    console.error('   Key    :', MTN_CONSUMER_KEY?.substring(0, 8) + '…');
+    throw err;
+  }
   const { access_token, expires_in } = response.data;
   if (!access_token) throw new Error('No access_token in MTN response');
 
@@ -430,6 +451,10 @@ app.get('/api/kyc/lookup', async (req, res) => {
     accessToken = await getMtnAccessToken();
   } catch (tokenErr) {
     console.error('❌ Token error:', tokenErr.message);
+    if (tokenErr.response) {
+      console.error('   Status:', tokenErr.response.status);
+      console.error('   Body:',   JSON.stringify(tokenErr.response.data));
+    }
     return res.status(503).json({
       success: false,
       error:   'Could not authenticate with MTN. Check consumer credentials.',
@@ -441,6 +466,7 @@ app.get('/api/kyc/lookup', async (req, res) => {
     const response = await axios.get(url, {
       headers: {
         'Authorization': `Bearer ${accessToken}`,
+        'x-api-key':     MTN_CONSUMER_KEY,   // YAML supports both; send both for safety
         'Accept':        'application/json',
         'transactionId': transactionId
       },
