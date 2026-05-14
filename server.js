@@ -1,562 +1,310 @@
-// ============================================================
-// DataFlow GH — Backend Server v2.0
-// Endpoints:
-//   GET  /health
-//   GET  /api/bundles?network=mtn|telecel|airteltigo
-//   POST /deliver
-//   POST /api/webhook/paystack
-//   GET  /api/kyc/lookup?phone=024XXXXXXX
-//   GET  /api/order-status?orderId=DF-xxx
-// ============================================================
+/**
+ * DataFlow GH — Chenosis KYC Backend Server
+ * Handles both KYC endpoints from Chenosis (MTN Ghana):
+ *
+ *  1. KYC Details  (/v1/gha/kyc-details)
+ *     → Sends SMS/USSD consent to customer → MTN calls back with full name/DOB/ID
+ *     → Best for auto-filling name at checkout (needs customer approval)
+ *
+ *  2. KYC Verify  (/kycVerify/gh/v1)
+ *     → You submit known customer data, API returns match % scores
+ *     → Best for verifying info you already have
+ *
+ * Routes exposed to your frontend (index.html):
+ *   POST /kyc/details          → trigger consent + wait for callback
+ *   POST /kyc/verify           → verify submitted data
+ *   POST /kyc/callback         → Chenosis posts KYC data here after consent
+ *   GET  /kyc/result/:txnId    → frontend polls this to get name after consent
+ *   GET  /kyc/health           → health check
+ */
 
-require('dotenv').config();
+const express = require('express');
+const cors    = require('cors');
+const crypto  = require('crypto');
 
-const express  = require('express');
-const axios    = require('axios');
-const cors     = require('cors');
-const crypto   = require('crypto');
-
-const app  = express();
-const PORT = process.env.PORT || 3000;
-
-// ============================================================
-// MIDDLEWARE
-// ============================================================
-app.use(cors({ origin: '*' }));
-
-// Raw body for Paystack webhook signature verification
-app.use('/api/webhook/paystack', express.raw({ type: 'application/json' }));
-
-// JSON for everything else
+const app = express();
 app.use(express.json());
+app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 
-// ============================================================
-// CONFIG
-// ============================================================
-const PAYSTACK_SECRET      = process.env.PAYSTACK_SECRET_KEY   || '';
-const REMADATA_BASE        = process.env.REMADATA_BASE         || 'https://api.remadata.net';
-const REMADATA_TOKEN       = process.env.REMADATA_TOKEN        || '';
-const REMADATA_SENDER      = process.env.REMADATA_SENDER       || '';
-const MTN_CONSUMER_KEY     = process.env.MTN_CONSUMER_KEY      || '';
-const MTN_CONSUMER_SECRET  = process.env.MTN_CONSUMER_SECRET   || '';
-// Docs: https://api.mtn.com/v1/oauth/access_token?grant_type=client_credentials
-// YAML: https://api.mtn.com/oauth/client_credential/accesstoken?grant_type=client_credentials
-// Using docs URL (v1 path) — change to YAML path if this 400s again
-const MTN_OAUTH_URL        = 'https://api.mtn.com/v1/oauth/access_token';
-const MTN_KYC_BASE         = 'https://api.mtn.com/v1/customers';
-const FIREBASE_DB_URL      = process.env.FIREBASE_DATABASE_URL || '';
+// ─── CONFIG — set all of these in Render → Environment Variables ──────────────
+const CHENOSIS_CLIENT_ID     = process.env.CHENOSIS_CLIENT_ID     || 'YOUR_CLIENT_ID';
+const CHENOSIS_CLIENT_SECRET = process.env.CHENOSIS_CLIENT_SECRET || 'YOUR_CLIENT_SECRET';
+const CHENOSIS_OAUTH_URL     = 'https://api.chenosis.io/oauth/client/accesstoken?grant_type=client_credentials';
+const KYC_DETAILS_BASE       = 'https://api.chenosis.io/v1/gha/kyc-details';
+const KYC_VERIFY_BASE        = 'https://api.chenosis.io/kycVerify/gh/v1';
+const MY_SERVER_URL          = process.env.MY_SERVER_URL || 'https://YOUR-SERVER.onrender.com';
+const COMPANY_NAME           = process.env.COMPANY_NAME  || 'DataFlow GH';
+const PORT                   = process.env.PORT          || 3001;
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ============================================================
-// FIREBASE ADMIN INIT
-// ============================================================
-let db = null;
-try {
-  const admin = require('firebase-admin');
-  if (!admin.apps.length) {
-    let credential;
-    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-      // Render: paste JSON as env var string
-      const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-      credential = admin.credential.cert(sa);
-    } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-      // Local: path to service account file
-      credential = admin.credential.applicationDefault();
-    }
-    if (credential) {
-      admin.initializeApp({ credential, databaseURL: FIREBASE_DB_URL });
-      db = admin.database();
-      console.log('✅ Firebase Admin connected');
-    } else {
-      console.warn('⚠️  No Firebase credentials — orders will not be saved to DB');
-    }
+// ─── In-memory store for pending consent results ──────────────────────────────
+// Key: transactionId  Value: { status, name, data, resolvedAt, createdAt }
+const consentResults = new Map();
+
+// Clean up entries older than 30 minutes
+setInterval(() => {
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  for (const [key, val] of consentResults) {
+    if (val.createdAt < cutoff) consentResults.delete(key);
   }
-} catch (e) {
-  console.warn('⚠️  Firebase Admin init failed:', e.message);
-}
+}, 30 * 60 * 1000);
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ============================================================
-// MTN OAUTH — TOKEN CACHE
-// ============================================================
-let mtnTokenCache = { token: null, expiresAt: 0 };
+// ─── OAuth Token Cache ────────────────────────────────────────────────────────
+let tokenCache = { token: null, expiresAt: 0 };
 
-async function getMtnAccessToken() {
-  const now = Date.now();
-  if (mtnTokenCache.token && now < mtnTokenCache.expiresAt - 60000) {
-    return mtnTokenCache.token;
+async function getToken() {
+  if (tokenCache.token && tokenCache.expiresAt > Date.now() + 60_000) {
+    return tokenCache.token;
   }
-  if (!MTN_CONSUMER_KEY || !MTN_CONSUMER_SECRET) {
-    throw new Error('MTN_CONSUMER_KEY or MTN_CONSUMER_SECRET not configured');
-  }
-  console.log('🔑 Fetching new MTN OAuth token…');
 
-  // Matches docs curl exactly:
-  // POST /v1/oauth/access_token?grant_type=client_credentials
-  // Body: client_id={key}&client_secret={secret}
-  const body = new URLSearchParams();
-  body.append('client_id',     MTN_CONSUMER_KEY);
-  body.append('client_secret', MTN_CONSUMER_SECRET);
+  const b64 = Buffer.from(`${CHENOSIS_CLIENT_ID}:${CHENOSIS_CLIENT_SECRET}`).toString('base64');
 
-  let response;
-  try {
-    response = await axios.post(
-      `${MTN_OAUTH_URL}?grant_type=client_credentials`,
-      body.toString(),
-      {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        timeout: 15000
-      }
-    );
-  } catch (err) {
-    // Log full MTN error so we can debug from Render logs
-    console.error('❌ MTN token request failed:');
-    console.error('   Status :', err.response?.status);
-    console.error('   Body   :', JSON.stringify(err.response?.data));
-    console.error('   URL    :', MTN_OAUTH_URL + '?grant_type=client_credentials');
-    console.error('   Key    :', MTN_CONSUMER_KEY?.substring(0, 8) + '…');
-    throw err;
-  }
-  const { access_token, expires_in } = response.data;
-  if (!access_token) throw new Error('No access_token in MTN response');
-
-  const expiresMs = (parseInt(expires_in, 10) || 3599) * 1000;
-  mtnTokenCache = { token: access_token, expiresAt: now + expiresMs };
-  console.log(`✅ MTN token valid for ${Math.round(expiresMs / 60000)} min`);
-  return access_token;
-}
-
-// ============================================================
-// HELPERS
-// ============================================================
-function toE164(phone) {
-  let p = phone.replace(/\s+/g, '').replace(/-/g, '');
-  if (p.startsWith('+')) p = p.substring(1);
-  if (p.startsWith('0')) p = '233' + p.substring(1);
-  return p;
-}
-
-function isValidMtn(phone) {
-  const clean = phone.replace(/\s+/g, '').replace(/-/g, '');
-  const mtnPrefixes = ['024', '054', '055', '059', '053'];
-  if (clean.startsWith('0'))   return mtnPrefixes.includes(clean.substring(0, 3));
-  if (clean.startsWith('233')) return mtnPrefixes.includes(clean.substring(3, 6));
-  return false;
-}
-
-const NETWORK_MAP = {
-  mtn:        'MTN',
-  telecel:    'TELECEL',
-  airteltigo: 'AIRTELTIGO',
-  at:         'AIRTELTIGO'
-};
-
-async function saveOrder(orderId, data) {
-  if (!db) return;
-  try {
-    await db.ref('orders/' + orderId).set(data);
-  } catch (e) {
-    console.warn('Firebase write failed:', e.message);
-  }
-}
-
-async function updateOrder(orderId, data) {
-  if (!db) return;
-  try {
-    await db.ref('orders/' + orderId).update(data);
-  } catch (e) {
-    console.warn('Firebase update failed:', e.message);
-  }
-}
-
-// ============================================================
-// GET /health
-// ============================================================
-app.get('/health', (req, res) => {
-  res.json({
-    status:             'OK',
-    version:            '2.0.0',
-    timestamp:          new Date().toISOString(),
-    firebase:           !!db,
-    kycConfigured:      !!(MTN_CONSUMER_KEY && MTN_CONSUMER_SECRET),
-    remaDataConfigured: !!REMADATA_TOKEN,
-    paystackConfigured: !!PAYSTACK_SECRET,
-    endpoints: [
-      'GET  /health',
-      'GET  /api/bundles?network=mtn|telecel|airteltigo',
-      'POST /deliver',
-      'POST /api/webhook/paystack',
-      'GET  /api/kyc/lookup?phone=024XXXXXXX',
-      'GET  /api/order-status?orderId=DF-xxx'
-    ]
+  const res = await fetch(CHENOSIS_OAUTH_URL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${b64}`,
+      'Content-Type':  'application/x-www-form-urlencoded',
+    },
   });
-});
 
-// ============================================================
-// GET /api/bundles?network=mtn|telecel|airteltigo
-// ============================================================
-app.get('/api/bundles', async (req, res) => {
-  const { network } = req.query;
-  if (!network) {
-    return res.status(400).json({ status: 'error', message: 'network param required' });
-  }
-  const remaNetwork = NETWORK_MAP[network.toLowerCase()];
-  if (!remaNetwork) {
-    return res.status(400).json({ status: 'error', message: `Unknown network: ${network}` });
-  }
-  if (!REMADATA_TOKEN) {
-    return res.status(503).json({ status: 'error', message: 'Bundle provider not configured' });
-  }
-  try {
-    console.log(`📦 Fetching ${remaNetwork} bundles from RemaData…`);
-    const response = await axios.get(`${REMADATA_BASE}/api/v1/bundles`, {
-      headers: { 'Authorization': `Bearer ${REMADATA_TOKEN}`, 'Accept': 'application/json' },
-      params:  { network: remaNetwork },
-      timeout: 12000
-    });
-    const raw     = response.data?.data || response.data || [];
-    const bundles = (Array.isArray(raw) ? raw : [])
-      .map(b => ({
-        volumeInMB: Number(b.volume || b.volumeInMB || b.size || 0),
-        price:      parseFloat(b.price || b.amount || 0),
-        name:       b.name || b.description || '',
-        network:    remaNetwork
-      }))
-      .filter(b => b.volumeInMB > 0 && b.price > 0);
-
-    console.log(`✅ ${bundles.length} bundles returned for ${remaNetwork}`);
-    res.json({ status: 'success', data: bundles });
-  } catch (err) {
-    console.error('❌ Bundles error:', err.response?.status, err.message);
-    res.status(502).json({
-      status:  'error',
-      message: err.response?.data?.message || 'Failed to fetch bundles'
-    });
-  }
-});
-
-// ============================================================
-// POST /deliver
-// Body: { phone, networkType, volumeInMB, ref, orderId? }
-// ============================================================
-app.post('/deliver', async (req, res) => {
-  const { phone, networkType, volumeInMB, ref, orderId } = req.body;
-
-  console.log('\n📦 Deliver request:', { phone, networkType, volumeInMB, ref });
-
-  if (!phone || !networkType || !volumeInMB || !ref) {
-    return res.status(400).json({
-      status:  'error',
-      message: 'Missing required fields: phone, networkType, volumeInMB, ref'
-    });
-  }
-  if (!REMADATA_TOKEN) {
-    return res.status(503).json({ status: 'error', message: 'Delivery provider not configured' });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`OAuth ${res.status}: ${txt}`);
   }
 
-  const remaNetwork = NETWORK_MAP[networkType.toLowerCase()] || networkType.toUpperCase();
-  const e164phone   = toE164(phone);
-
-  const payload = {
-    phone:   e164phone,
-    network: remaNetwork,
-    volume:  Number(volumeInMB),
-    ref:     ref,
-    sender:  REMADATA_SENDER
+  const json = await res.json();
+  tokenCache = {
+    token:     json.access_token,
+    expiresAt: Date.now() + (parseInt(json.expires_in, 10) || 3599) * 1000,
   };
 
-  console.log('📤 RemaData payload:', payload);
+  console.log('[KYC] Token refreshed, expires in', json.expires_in, 's');
+  return tokenCache.token;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── Phone helpers ────────────────────────────────────────────────────────────
+function toE164(phone) {
+  const d = phone.replace(/\D/g, '');
+  if (d.startsWith('233')) return d;
+  if (d.startsWith('0'))   return '233' + d.slice(1);
+  if (d.length === 9)      return '233' + d;
+  return d;
+}
+
+function isMTNGhana(msisdn) {
+  const prefix = msisdn.slice(3, 5);
+  return ['24','25','53','54','55','59'].includes(prefix);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROUTE 1: POST /kyc/details
+// Sends an SMS or USSD consent prompt to the customer.
+// Chenosis calls /kyc/callback when the customer approves.
+// Frontend then polls /kyc/result/:txnId for the name.
+//
+// Body: { phone: "024XXXXXXX", consentType: "sms" | "ussd" }
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/kyc/details', async (req, res) => {
+  const { phone, consentType = 'sms' } = req.body;
+
+  if (!phone) return res.status(400).json({ status: 'error', message: 'phone required' });
+
+  const msisdn = toE164(phone);
+
+  if (!isMTNGhana(msisdn)) {
+    return res.json({
+      status:  'not_mtn',
+      message: 'KYC Details only available for MTN Ghana numbers',
+      name:    null,
+    });
+  }
+
+  const transactionId = crypto.randomUUID();
+
+  consentResults.set(transactionId, {
+    status:    'pending',
+    name:      null,
+    data:      null,
+    createdAt: Date.now(),
+  });
 
   try {
-    const response = await axios.post(`${REMADATA_BASE}/api/v1/send`, payload, {
+    const token       = await getToken();
+    const callbackUrl = `${MY_SERVER_URL}/kyc/callback?txn=${transactionId}`;
+
+    const chRes = await fetch(`${KYC_DETAILS_BASE}/customers/${msisdn}`, {
+      method:  'POST',
       headers: {
-        'Authorization': `Bearer ${REMADATA_TOKEN}`,
+        'Authorization': `Bearer ${token}`,
         'Content-Type':  'application/json',
-        'Accept':        'application/json'
+        'transactionId': transactionId,
       },
-      timeout: 30000
+      body: JSON.stringify({
+        consentType,
+        companyName: COMPANY_NAME,
+        callbackUrl,
+      }),
     });
 
-    const result = response.data;
-    console.log('✅ RemaData response:', JSON.stringify(result));
+    const chData = await chRes.json();
+    console.log('[KYC Details] Chenosis:', chRes.status, JSON.stringify(chData));
 
-    if (result.status === 'success' || result.success === true) {
-      const providerRef = result.reference || result.data?.reference || ref;
-      if (orderId) {
-        await updateOrder(orderId, {
-          status:         'completed',
-          deliveryStatus: 'delivered',
-          deliveryTime:   new Date().toISOString(),
-          providerRef
-        });
-      }
+    if (chRes.ok && chData.statusCode === '0000') {
       return res.json({
-        status:    'success',
-        message:   result.message || 'Bundle delivered successfully',
-        reference: providerRef,
-        orderId:   orderId || ref
-      });
-    } else {
-      console.warn('⚠️ RemaData non-success:', result);
-      if (orderId) await updateOrder(orderId, { status: 'paid-pending-delivery', deliveryError: result.message });
-      return res.status(400).json({
-        status:  'error',
-        message: result.message || 'Delivery failed at provider'
+        status:        'consent_sent',
+        transactionId,
+        message:       `Consent request sent to ${phone} via ${consentType.toUpperCase()}`,
+        chenosisMsg:   chData.statusMessage,
       });
     }
-  } catch (err) {
-    console.error('❌ Delivery error:', err.response?.status, err.response?.data || err.message);
-    if (orderId) await updateOrder(orderId, { status: 'paid-pending-delivery', error: err.message });
-    return res.status(502).json({
+
+    consentResults.delete(transactionId);
+    return res.status(chRes.status).json({
       status:  'error',
-      message: err.response?.data?.message || 'Delivery request failed — payment was received'
+      message: chData.statusMessage || 'Chenosis error',
+      code:    chData.statusCode,
     });
+
+  } catch (err) {
+    console.error('[KYC Details] Error:', err.message);
+    consentResults.delete(transactionId);
+    return res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
-// ============================================================
-// POST /api/webhook/paystack
-// Verifies Paystack signature, auto-delivers on charge.success
-// ============================================================
-app.post('/api/webhook/paystack', async (req, res) => {
-  // Verify signature
-  const signature = req.headers['x-paystack-signature'];
-  if (!PAYSTACK_SECRET || !signature) {
-    return res.status(400).json({ error: 'Missing signature or secret' });
-  }
-  const hash = crypto
-    .createHmac('sha512', PAYSTACK_SECRET)
-    .update(req.body)
-    .digest('hex');
 
-  if (hash !== signature) {
-    console.warn('⚠️ Invalid Paystack webhook signature');
-    return res.status(401).json({ error: 'Invalid signature' });
-  }
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROUTE 2: POST /kyc/callback
+// Chenosis POSTs here after customer approves the consent SMS/USSD.
+// Stores the name so the frontend can retrieve it via /kyc/result/:txnId
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/kyc/callback', (req, res) => {
+  const txnId = req.query.txn;
+  const body  = req.body;
 
-  // Parse event
-  let event;
-  try {
-    event = JSON.parse(req.body.toString());
-  } catch (e) {
-    return res.status(400).json({ error: 'Invalid JSON body' });
-  }
+  console.log('[KYC Callback] txn:', txnId, JSON.stringify(body));
 
-  console.log(`\n🔔 Paystack webhook: ${event.event}`);
+  // Always 200 immediately so Chenosis doesn't retry
+  res.status(200).json({ statusCode: '0000', statusMessage: 'Received' });
 
-  // Acknowledge immediately
-  res.json({ received: true });
-
-  if (event.event !== 'charge.success') return;
-
-  const data       = event.data;
-  const ref        = data.reference;
-  const meta       = data.metadata || {};
-  const phone      = meta.phone      || data.customer?.phone || '';
-  const networkType= meta.networkType|| 'mtn';
-  const volumeInMB = Number(meta.volumeInMB || 0);
-  const orderId    = meta.orderId    || ('DF-' + Date.now());
-  const name       = meta.custom_fields?.find(f => f.variable_name === 'name')?.value || '';
-  const email      = data.customer?.email || '';
-  const amount     = data.amount / 100;
-
-  console.log(`✅ Payment confirmed: ${ref} | ${phone} | ${volumeInMB}MB | ${networkType}`);
-
-  // Save order to Firebase if not already there
-  if (db) {
-    const existing = await db.ref('orders/' + orderId).once('value');
-    if (!existing.val()) {
-      await saveOrder(orderId, {
-        orderId, ref, phone, email, name,
-        networkType, volumeInMB,
-        amount, status: 'paid',
-        deliveryStatus: 'pending',
-        timestamp: new Date().toISOString(),
-        source: 'webhook'
-      });
-    }
-  }
-
-  if (!phone || !volumeInMB) {
-    console.warn('⚠️ Webhook missing phone or volumeInMB — skipping delivery');
+  if (!txnId || !consentResults.has(txnId)) {
+    console.warn('[KYC Callback] Unknown txnId:', txnId);
     return;
   }
 
-  // Deliver
-  try {
-    const remaNetwork = NETWORK_MAP[networkType.toLowerCase()] || 'MTN';
-    const payload = {
-      phone:   toE164(phone),
-      network: remaNetwork,
-      volume:  volumeInMB,
-      ref:     ref,
-      sender:  REMADATA_SENDER
-    };
-    const response = await axios.post(`${REMADATA_BASE}/api/v1/send`, payload, {
-      headers: {
-        'Authorization': `Bearer ${REMADATA_TOKEN}`,
-        'Content-Type':  'application/json'
-      },
-      timeout: 30000
-    });
-    const result = response.data;
-    if (result.status === 'success' || result.success === true) {
-      await updateOrder(orderId, {
-        status: 'completed', deliveryStatus: 'delivered',
-        deliveryTime: new Date().toISOString(),
-        providerRef: result.reference || result.data?.reference || ref
-      });
-      console.log(`✅ Webhook delivery success for ${orderId}`);
-    } else {
-      await updateOrder(orderId, { status: 'paid-pending-delivery', deliveryError: result.message });
-      console.warn('⚠️ Webhook delivery failed:', result.message);
-    }
-  } catch (err) {
-    await updateOrder(orderId, { status: 'paid-pending-delivery', error: err.message });
-    console.error('❌ Webhook delivery error:', err.message);
-  }
+  const data      = body?.data || body;
+  const firstName = data?.firstName || '';
+  const lastName  = data?.lastName  || '';
+  const fullName  = `${firstName} ${lastName}`.trim() || null;
+
+  consentResults.set(txnId, {
+    status:     fullName ? 'resolved' : 'no_data',
+    name:       fullName,
+    data,
+    resolvedAt: Date.now(),
+    createdAt:  consentResults.get(txnId)?.createdAt || Date.now(),
+  });
+
+  console.log('[KYC Callback] Resolved:', fullName, 'for txn:', txnId);
 });
 
-// ============================================================
-// GET /api/kyc/lookup?phone=024XXXXXXX
-// MTN KYC — OAuth 2.0 Bearer token (auto-refresh)
-// ============================================================
-app.get('/api/kyc/lookup', async (req, res) => {
-  const { phone } = req.query;
 
-  if (!phone) {
-    return res.status(400).json({ success: false, error: 'phone param required', code: 'MISSING_PHONE' });
-  }
-  if (!isValidMtn(phone)) {
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROUTE 3: GET /kyc/result/:txnId
+// Frontend polls this every 3 seconds waiting for consent approval.
+// Returns: { status: "pending" | "resolved" | "no_data" | "not_found", name }
+// ═══════════════════════════════════════════════════════════════════════════════
+app.get('/kyc/result/:txnId', (req, res) => {
+  const result = consentResults.get(req.params.txnId);
+  if (!result) return res.status(404).json({ status: 'not_found' });
+
+  return res.json({ status: result.status, name: result.name });
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROUTE 4: POST /kyc/verify
+// Cross-checks data the customer typed against MTN's records.
+// Returns a match score per field (0–100). 100 = exact match.
+// Useful for fraud-checking after checkout.
+//
+// Body: { phone, firstName, lastName, emailAddress, nationalIdNumber,
+//          streetAddress, city, postCode, country }
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/kyc/verify', async (req, res) => {
+  const { phone, firstName, lastName, emailAddress = '',
+          nationalIdNumber = '', streetAddress = '',
+          city = '', postCode = '', country = 'Ghana' } = req.body;
+
+  if (!phone || !firstName || !lastName) {
     return res.status(400).json({
-      success: false,
-      error:   'Not an MTN number. MTN numbers start with 024, 054, 055, 053, or 059',
-      code:    'INVALID_NETWORK'
-    });
-  }
-  if (!MTN_CONSUMER_KEY || !MTN_CONSUMER_SECRET) {
-    return res.status(503).json({
-      success: false,
-      error:   'KYC service not configured — contact support',
-      code:    'NOT_CONFIGURED'
+      status: 'error', message: 'phone, firstName, and lastName are required',
     });
   }
 
-  const formattedPhone  = toE164(phone);
-  const transactionId   = `DF-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-  const url             = `${MTN_KYC_BASE}/${formattedPhone}/kyc`;
-
-  console.log(`\n📞 KYC lookup: ${phone} → ${formattedPhone}`);
-
-  let accessToken;
-  try {
-    accessToken = await getMtnAccessToken();
-  } catch (tokenErr) {
-    console.error('❌ Token error:', tokenErr.message);
-    if (tokenErr.response) {
-      console.error('   Status:', tokenErr.response.status);
-      console.error('   Body:',   JSON.stringify(tokenErr.response.data));
-    }
-    return res.status(503).json({
-      success: false,
-      error:   'Could not authenticate with MTN. Check consumer credentials.',
-      code:    'TOKEN_ERROR'
-    });
-  }
+  const msisdn = toE164(phone);
 
   try {
-    const response = await axios.get(url, {
+    const token = await getToken();
+
+    const chRes = await fetch(`${KYC_VERIFY_BASE}/customers/${msisdn}`, {
+      method:  'POST',
       headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'x-api-key':     MTN_CONSUMER_KEY,   // YAML supports both; send both for safety
-        'Accept':        'application/json',
-        'transactionId': transactionId
+        'Authorization': `Bearer ${token}`,
+        'Content-Type':  'application/json',
       },
-      timeout: 20000
+      body: JSON.stringify({
+        firstName, lastName,
+        phoneNumber:      msisdn,
+        emailAddress,
+        nationalIdNumber,
+        streetAddress,
+        city, postCode, country,
+      }),
     });
 
-    const kycData = response.data?.data || response.data;
-    const firstName = kycData?.firstName || '';
-    const lastName  = kycData?.lastName  || '';
+    const chData = await chRes.json();
+    console.log('[KYC Verify] Chenosis:', chRes.status, JSON.stringify(chData));
 
-    console.log(`✅ KYC success: ${firstName} ${lastName}`);
+    if (!chRes.ok) {
+      return res.status(chRes.status).json({
+        status:  'error',
+        message: chData.statusMessage || 'Verification failed',
+        code:    chData.statusCode,
+      });
+    }
+
+    const scores    = chData?.data || {};
+    const nameScore = Math.round(((scores.firstName || 0) + (scores.lastName || 0)) / 2);
 
     return res.json({
-      success: true,
-      data: {
-        firstName,
-        lastName,
-        fullName:    `${firstName} ${lastName}`.trim(),
-        idType:      kycData?.idType      || null,
-        idNumber:    kycData?.idNumber    || null,
-        dateOfBirth: kycData?.dateOfBirth || null,
-        gender:      kycData?.gender      || null
-      },
-      timestamp: new Date().toISOString()
+      status:        'verified',
+      nameScore,
+      scores,
+      customerId:    chData.customerId,
+      transactionId: chData.transactionId,
     });
 
   } catch (err) {
-    const status = err.response?.status;
-    console.error(`❌ KYC error ${status}:`, err.response?.data || err.message);
-
-    // Clear token cache on 401 so next call re-fetches
-    if (status === 401) mtnTokenCache = { token: null, expiresAt: 0 };
-
-    const errorMap = {
-      401: 'MTN session expired — please try again',
-      403: 'KYC permission not enabled on your MTN app',
-      404: 'Customer not found in MTN records',
-      400: 'Invalid phone number format'
-    };
-    return res.status(status || 502).json({
-      success: false,
-      error:   errorMap[status] || err.response?.data?.message || 'KYC lookup failed',
-      code:    'KYC_ERROR'
-    });
+    console.error('[KYC Verify] Error:', err.message);
+    return res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
-// ============================================================
-// GET /api/order-status?orderId=DF-xxx
-// ============================================================
-app.get('/api/order-status', async (req, res) => {
-  const { orderId, phone } = req.query;
-  if (!orderId && !phone) {
-    return res.status(400).json({ status: 'error', message: 'orderId or phone required' });
-  }
-  if (!db) {
-    return res.status(503).json({ status: 'error', message: 'Database not configured' });
-  }
-  try {
-    if (orderId) {
-      const snap = await db.ref('orders/' + orderId).once('value');
-      const order = snap.val();
-      if (!order) return res.status(404).json({ status: 'error', message: 'Order not found' });
-      return res.json({ status: 'success', data: order });
-    }
-    // Search by phone
-    const snap = await db.ref('orders').orderByChild('phone').equalTo(phone).once('value');
-    const data  = snap.val();
-    if (!data) return res.status(404).json({ status: 'error', message: 'No orders found for this number' });
-    const orders = Object.values(data).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-    return res.json({ status: 'success', data: orders });
-  } catch (err) {
-    console.error('Order status error:', err.message);
-    return res.status(500).json({ status: 'error', message: 'Server error' });
-  }
+
+// ─── Health check ─────────────────────────────────────────────────────────────
+app.get('/kyc/health', (_req, res) => {
+  res.json({
+    status:          'ok',
+    service:         'DataFlow GH KYC Server',
+    tokenCached:     !!tokenCache.token,
+    tokenExpiresIn:  Math.max(0, Math.round((tokenCache.expiresAt - Date.now()) / 1000)) + 's',
+    pendingConsents: consentResults.size,
+  });
 });
 
-// ============================================================
-// START SERVER
-// ============================================================
-app.listen(PORT, () => {
-  console.log(`
-╔══════════════════════════════════════════════════════════════╗
-║   🚀 DataFlow Backend v2.0                                   ║
-║   📡 Port:      ${String(PORT).padEnd(45)}║
-║   🔥 Firebase:  ${(db ? '✅ Connected' : '❌ Not configured').padEnd(45)}║
-║   🔑 MTN KYC:   ${((MTN_CONSUMER_KEY && MTN_CONSUMER_SECRET) ? '✅ Configured' : '❌ Missing KEY/SECRET').padEnd(45)}║
-║   📦 RemaData:  ${(REMADATA_TOKEN ? '✅ Configured' : '❌ Missing TOKEN').padEnd(45)}║
-║   💳 Paystack:  ${(PAYSTACK_SECRET ? '✅ Configured' : '❌ Missing SECRET').padEnd(45)}║
-╚══════════════════════════════════════════════════════════════╝`);
-});
-
-module.exports = app;
+app.listen(PORT, () => console.log(`✅ DataFlow KYC server on port ${PORT}`));
