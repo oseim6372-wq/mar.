@@ -6,20 +6,13 @@
  * ┌─────────────────────────────────────────────────────────────────┐
  * │ API A — MTN Direct (api.mtn.com)  ← PRIMARY, USE THIS FIRST   │
  * │   GET /v1/customers/{msisdn}/kyc                                │
- * │   Auth: MTN OAuth only (no API key) ✅                          │
- * │   Returns: name instantly, no SMS consent needed               │
+ * │   Auth: MTN OAuth (from /v1/oauth/access_token) + x-api-key   │
+ * │   Returns: name instantly, no SMS consent needed ✅             │
  * ├─────────────────────────────────────────────────────────────────┤
  * │ API B — Chenosis (api.chenosis.io) ← FALLBACK                  │
  * │   POST /v1/gha/kyc-details + callback flow                      │
  * │   Returns: name after customer approves SMS consent             │
  * └─────────────────────────────────────────────────────────────────┘
- *
- * Routes your frontend calls:
- *   POST /kyc/lookup          → MTN Direct: returns name instantly
- *   POST /kyc/details         → Chenosis consent flow (fallback)
- *   POST /kyc/callback        → Chenosis posts here after consent
- *   GET  /kyc/result/:txnId   → poll for Chenosis consent result
- *   GET  /kyc/health          → health check
  */
 
 const express = require('express');
@@ -31,13 +24,14 @@ app.use(express.json());
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 
 // ─── CONFIG — set in Render → Environment Variables ───────────────────────────
-// MTN Direct API (api.mtn.com) — OAuth only, no API key needed
+// MTN Direct API (api.mtn.com)
 const MTN_CLIENT_ID      = process.env.MTN_CLIENT_ID      || 'YOUR_MTN_CLIENT_ID';
 const MTN_CLIENT_SECRET  = process.env.MTN_CLIENT_SECRET  || 'YOUR_MTN_CLIENT_SECRET';
+const MTN_API_KEY        = process.env.MTN_API_KEY        || 'YOUR_MTN_X_API_KEY';
 const MTN_OAUTH_URL      = 'https://api.mtn.com/v1/oauth/access_token';
 const MTN_KYC_BASE       = 'https://api.mtn.com/v1/customers';
 
-// Chenosis API (fallback — needs separate credentials)
+// Chenosis API (fallback)
 const CHENOSIS_CLIENT_ID     = process.env.CHENOSIS_CLIENT_ID     || 'YOUR_CHENOSIS_CLIENT_ID';
 const CHENOSIS_CLIENT_SECRET = process.env.CHENOSIS_CLIENT_SECRET || 'YOUR_CHENOSIS_CLIENT_SECRET';
 const CHENOSIS_OAUTH_URL     = 'https://api.chenosis.io/oauth/client/accesstoken?grant_type=client_credentials';
@@ -49,37 +43,70 @@ const PORT          = process.env.PORT          || 3001;
 // ─────────────────────────────────────────────────────────────────────────────
 
 
-// ─── Token caches (one per API) ───────────────────────────────────────────────
+// ─── Token caches ─────────────────────────────────────────────────────────────
 const tokenCache = {
   mtn:      { token: null, expiresAt: 0 },
   chenosis: { token: null, expiresAt: 0 },
 };
 
-async function getToken(api) {
-  const cache = tokenCache[api];
+async function getMtnToken() {
+  const cache = tokenCache.mtn;
   if (cache.token && cache.expiresAt > Date.now() + 60_000) return cache.token;
 
-  const configs = {
-    mtn:      { url: MTN_OAUTH_URL,      id: MTN_CLIENT_ID,      secret: MTN_CLIENT_SECRET },
-    chenosis: { url: CHENOSIS_OAUTH_URL, id: CHENOSIS_CLIENT_ID, secret: CHENOSIS_CLIENT_SECRET },
-  };
-  const { url, id, secret } = configs[api];
-
+  // Per Screenshot 1: append grant_type to URL and send client_id/secret in body
+  const url = `${MTN_OAUTH_URL}?grant_type=client_credentials`;
+  
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: `grant_type=client_credentials&client_id=${encodeURIComponent(id)}&client_secret=${encodeURIComponent(secret)}`,
+    body: `client_id=${encodeURIComponent(MTN_CLIENT_ID)}&client_secret=${encodeURIComponent(MTN_CLIENT_SECRET)}`,
   });
 
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error(`[${api}] OAuth ${res.status}: ${txt}`);
+    throw new Error(`[MTN OAuth] ${res.status}: ${txt}`);
   }
 
   const json = await res.json();
-  cache.token     = json.access_token;
+  
+  // Per Screenshot 1 response format, token is inside api_product_list_json array
+  let accessToken = null;
+  if (json.api_product_list_json && Array.isArray(json.api_product_list_json) && json.api_product_list_json[0]) {
+    accessToken = json.api_product_list_json[0].access_token;
+  }
+  if (!accessToken) {
+    accessToken = json.access_token;
+  }
+  
+  if (!accessToken) {
+    throw new Error(`[MTN OAuth] No access_token in response: ${JSON.stringify(json)}`);
+  }
+
+  cache.token = accessToken;
+  cache.expiresAt = Date.now() + 3599 * 1000; // 3599 seconds from screenshot
+  console.log(`[KYC] MTN token obtained, expires in 3599s`);
+  return cache.token;
+}
+
+async function getChenosisToken() {
+  const cache = tokenCache.chenosis;
+  if (cache.token && cache.expiresAt > Date.now() + 60_000) return cache.token;
+
+  const res = await fetch(CHENOSIS_OAUTH_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=client_credentials&client_id=${encodeURIComponent(CHENOSIS_CLIENT_ID)}&client_secret=${encodeURIComponent(CHENOSIS_CLIENT_SECRET)}`,
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`[Chenosis OAuth] ${res.status}: ${txt}`);
+  }
+
+  const json = await res.json();
+  cache.token = json.access_token;
   cache.expiresAt = Date.now() + (parseInt(json.expires_in, 10) || 3599) * 1000;
-  console.log(`[KYC] ${api} token refreshed, expires in ${json.expires_in}s`);
+  console.log(`[KYC] Chenosis token refreshed`);
   return cache.token;
 }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,7 +122,7 @@ function toE164(phone) {
 }
 
 function isMTNGhana(msisdn) {
-  const prefix = msisdn.slice(3, 5); // digits after 233
+  const prefix = msisdn.slice(3, 5);
   return ['24','25','53','54','55','59'].includes(prefix);
 }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -111,14 +138,8 @@ setInterval(() => {
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ROUTE 1 — POST /kyc/lookup  ← FRONTEND CALLS THIS
-//
-// Uses MTN Direct API (api.mtn.com/v1/customers/{msisdn}/kyc)
-// Simple GET — no SMS, no polling, returns name immediately.
-// Auth: Bearer token only (no API key needed)
-//
-// Body:     { phone: "024XXXXXXX" }
-// Response: { status: "found"|"not_found"|"not_mtn"|"error", name }
+// ROUTE 1 — POST /kyc/lookup
+// Uses MTN Direct API with OAuth Bearer token + x-api-key header
 // ═══════════════════════════════════════════════════════════════════════════════
 app.post('/kyc/lookup', async (req, res) => {
   const { phone } = req.body;
@@ -132,14 +153,14 @@ app.post('/kyc/lookup', async (req, res) => {
   }
 
   try {
-    const token = await getToken('mtn');
-    // transactionId: 5–20 ASCII chars per MTN spec
-    const txnId = crypto.randomBytes(8).toString('hex'); // 16 chars
+    const token = await getMtnToken();
+    const txnId = crypto.randomBytes(8).toString('hex');
 
     const mtnRes = await fetch(`${MTN_KYC_BASE}/${msisdn}/kyc`, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${token}`,
+        'x-api-key':     MTN_API_KEY,
         'transactionId': txnId,
         'Content-Type':  'application/json',
       },
@@ -157,17 +178,17 @@ app.post('/kyc/lookup', async (req, res) => {
       return res.status(502).json({ status: 'error', message: `MTN KYC error: ${mtnRes.status}` });
     }
 
-    const body      = await mtnRes.json();
-    const kycData   = body?.data || body;
+    const body = await mtnRes.json();
+    const kycData = body?.data || body;
     const firstName = kycData?.firstName || '';
-    const lastName  = kycData?.lastName  || '';
-    const fullName  = `${firstName} ${lastName}`.trim() || null;
+    const lastName = kycData?.lastName || '';
+    const fullName = `${firstName} ${lastName}`.trim() || null;
 
     console.log('[KYC Lookup] Name resolved:', fullName);
 
     return res.json({
       status: fullName ? 'found' : 'not_found',
-      name:   fullName,
+      name: fullName,
       msisdn,
     });
 
@@ -179,11 +200,7 @@ app.post('/kyc/lookup', async (req, res) => {
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ROUTE 2 — POST /kyc/details  (Chenosis fallback — requires SMS consent)
-//
-// Body:     { phone: "024XXXXXXX", consentType: "sms" | "ussd" }
-// Response: { status: "consent_sent", transactionId }
-// Then poll GET /kyc/result/:txnId every 3s for the name.
+// ROUTE 2 — POST /kyc/details (Chenosis fallback)
 // ═══════════════════════════════════════════════════════════════════════════════
 app.post('/kyc/details', async (req, res) => {
   const { phone, consentType = 'sms' } = req.body;
@@ -196,14 +213,14 @@ app.post('/kyc/details', async (req, res) => {
   consentResults.set(transactionId, { status: 'pending', name: null, data: null, createdAt: Date.now() });
 
   try {
-    const token       = await getToken('chenosis');
+    const token = await getChenosisToken();
     const callbackUrl = `${MY_SERVER_URL}/kyc/callback?txn=${transactionId}`;
 
     const chRes = await fetch(`${CHENOSIS_KYC_BASE}/customers/${msisdn}`, {
-      method:  'POST',
+      method: 'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
-        'Content-Type':  'application/json',
+        'Content-Type': 'application/json',
         'transactionId': transactionId,
       },
       body: JSON.stringify({ consentType, companyName: COMPANY_NAME, callbackUrl }),
@@ -230,7 +247,7 @@ app.post('/kyc/details', async (req, res) => {
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ROUTE 3 — POST /kyc/callback  (Chenosis posts here after customer approves)
+// ROUTE 3 — POST /kyc/callback (Chenosis webhook)
 // ═══════════════════════════════════════════════════════════════════════════════
 app.post('/kyc/callback', (req, res) => {
   const txnId = req.query.txn;
@@ -238,21 +255,21 @@ app.post('/kyc/callback', (req, res) => {
 
   if (!txnId || !consentResults.has(txnId)) return;
 
-  const data     = req.body?.data || req.body;
+  const data = req.body?.data || req.body;
   const fullName = `${data?.firstName || ''} ${data?.lastName || ''}`.trim() || null;
 
   consentResults.set(txnId, {
-    status:     fullName ? 'resolved' : 'no_data',
-    name:       fullName, data,
+    status: fullName ? 'resolved' : 'no_data',
+    name: fullName, data,
     resolvedAt: Date.now(),
-    createdAt:  consentResults.get(txnId)?.createdAt || Date.now(),
+    createdAt: consentResults.get(txnId)?.createdAt || Date.now(),
   });
   console.log('[KYC Callback] Resolved:', fullName, 'txn:', txnId);
 });
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ROUTE 4 — GET /kyc/result/:txnId  (frontend polls for Chenosis consent result)
+// ROUTE 4 — GET /kyc/result/:txnId (poll for Chenosis result)
 // ═══════════════════════════════════════════════════════════════════════════════
 app.get('/kyc/result/:txnId', (req, res) => {
   const result = consentResults.get(req.params.txnId);
@@ -264,11 +281,11 @@ app.get('/kyc/result/:txnId', (req, res) => {
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/kyc/health', (_req, res) => {
   res.json({
-    status:              'ok',
-    service:             'DataFlow GH KYC Server v2',
-    mtnTokenCached:      !!tokenCache.mtn.token,
+    status: 'ok',
+    service: 'DataFlow GH KYC Server v2',
+    mtnTokenCached: !!tokenCache.mtn.token,
     chenosisTokenCached: !!tokenCache.chenosis.token,
-    pendingConsents:     consentResults.size,
+    pendingConsents: consentResults.size,
   });
 });
 
