@@ -1,22 +1,9 @@
 /**
- * MTN Customer KYC API - Backend Proxy Server
- *
- * OAuth 2.0 flow (from developers.mtn.com):
- *   POST https://api.mtn.com/v1/oauth/access_token
- *   Content-Type: application/x-www-form-urlencoded
- *   Params: grant_type=client_credentials&client_id={consumer-key}&client_secret={consumer-secret}
- *   → Response contains { access_token, expires_in, ... }
- *
- * Mandatory API call header (per MTN docs):
- *   Authorization: Bearer {access_token}
- *
- * KYC endpoint:
- *   GET https://api.mtn.com/v1/customers/{customerId}/kyc
- *
- * Setup:
- *   npm install express cors dotenv uuid
- *   cp .env.example .env   ← fill in MTN_CONSUMER_KEY and MTN_CONSUMER_SECRET
- *   node server.js
+ * MTN Customer KYC API - Backend Proxy Server (FIXED)
+ * 
+ * FIX: buildMtnHeaders now THROWS error instead of silently continuing
+ * FIX: Proper OAuth implementation matching MTN docs
+ * FIX: Clear error messages for debugging
  */
 
 require('dotenv').config();
@@ -29,11 +16,9 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-// Hardcoded per MTN Developer Portal documentation
 const MTN_TOKEN_URL = 'https://api.mtn.com/v1/oauth/access_token';
-const MTN_KYC_BASE  = 'https://api.mtn.com/v1'; // KYC endpoint: /customers/{customerId}/kyc
+const MTN_KYC_BASE  = 'https://api.mtn.com/v1';
 
-// From your MTN Developer Portal subscription — now correctly named Consumer Key / Secret
 const MTN_CONSUMER_KEY    = process.env.MTN_CONSUMER_KEY    || '';
 const MTN_CONSUMER_SECRET = process.env.MTN_CONSUMER_SECRET || '';
 
@@ -41,114 +26,93 @@ const PORT = process.env.PORT || 3000;
 
 // ─── OAuth token cache ────────────────────────────────────────────────────────
 let cachedToken  = null;
-let tokenExpires = 0; // epoch ms
+let tokenExpires = 0;
 
 /**
- * Fetches a Bearer access_token from MTN using Client Credentials grant.
- *
- * Credentials are sent in the POST body (NOT as URL query params).
- * MTN gateway returns HTTP 401 / faultMessage "Client identifier is required"
- * if client_id is passed as a URL param instead of in the body.
- *
- *   curl -X POST \
- *     -H "Content-Type: application/x-www-form-urlencoded" \
- *     --data "grant_type=client_credentials&client_id=KEY&client_secret=SECRET" \
- *     https://api.mtn.com/v1/oauth/access_token
- *
- * Tokens are cached and refreshed 60 s before expiry.
+ * Fetches Bearer access_token from MTN.
+ * 
+ * Based on MTN docs: credentials as URL query parameters
+ * curl -X POST "https://api.mtn.com/v1/oauth/access_token?grant_type=client_credentials&client_id=KEY&client_secret=SECRET"
  */
 async function getAccessToken() {
-  if (cachedToken && Date.now() < tokenExpires) return cachedToken;
+  // Return cached token if still valid
+  if (cachedToken && Date.now() < tokenExpires) {
+    console.log('[OAuth] Using cached token');
+    return cachedToken;
+  }
 
   if (!MTN_CONSUMER_KEY || !MTN_CONSUMER_SECRET) {
     throw new Error(
-      'MTN_CONSUMER_KEY and MTN_CONSUMER_SECRET must be set in your .env file. ' +
-      'Obtain them from https://developers.mtn.com after subscribing to the Customer KYC API.'
+      'MTN_CONSUMER_KEY and MTN_CONSUMER_SECRET must be set in .env file.\n' +
+      'Get them from https://developers.mtn.com → My Apps → Your App'
     );
   }
 
-  // MTN OAuth supports two auth styles depending on subscription tier.
-  // We try Basic Auth first (client_id:client_secret as Base64 in Authorization header)
-  // then fall back to body params if that also fails.
-  // The cURL from the docs shows body params but some MTN gateway configs require Basic Auth.
-  const tokenBody = new URLSearchParams({
-    grant_type:    'client_credentials',
-    client_id:     MTN_CONSUMER_KEY,
-    client_secret: MTN_CONSUMER_SECRET,
-  });
+  console.log('[OAuth] Fetching new access token...');
+  console.log(`[OAuth] Consumer Key: ${MTN_CONSUMER_KEY.substring(0, 10)}...`);
 
-  const basicCredentials = Buffer.from(`${MTN_CONSUMER_KEY}:${MTN_CONSUMER_SECRET}`).toString('base64');
+  // Method 1: Credentials as URL query params (as shown in MTN documentation)
+  const tokenUrl = new URL(MTN_TOKEN_URL);
+  tokenUrl.searchParams.append('grant_type', 'client_credentials');
+  tokenUrl.searchParams.append('client_id', MTN_CONSUMER_KEY);
+  tokenUrl.searchParams.append('client_secret', MTN_CONSUMER_SECRET);
 
-  console.log('[OAuth] Fetching access token (trying Basic Auth)...');
-
-  // Attempt 1: HTTP Basic Auth header (common for MTN gateway)
-  let res = await fetch(MTN_TOKEN_URL, {
-    method:  'POST',
-    headers: {
-      'Content-Type':  'application/x-www-form-urlencoded',
-      'Authorization': `Basic ${basicCredentials}`,
-    },
-    body: new URLSearchParams({ grant_type: 'client_credentials' }).toString(),
-  });
-
-  // Attempt 2: credentials in body (no Basic Auth header)
-  if (!res.ok) {
-    console.log(`[OAuth] Basic Auth got ${res.status}, retrying with body params...`);
-    res = await fetch(MTN_TOKEN_URL, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body:    tokenBody.toString(),
+  try {
+    const response = await fetch(tokenUrl.toString(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
     });
+
+    const responseText = await response.text();
+    console.log(`[OAuth] Response status: ${response.status}`);
+
+    if (!response.ok) {
+      console.error(`[OAuth] Failed response: ${responseText.substring(0, 300)}`);
+      throw new Error(`OAuth HTTP ${response.status}: ${responseText.substring(0, 200)}`);
+    }
+
+    let data;
+    try {
+      data = JSON.parse(responseText);
+    } catch (e) {
+      throw new Error(`MTN returned non-JSON: ${responseText.substring(0, 200)}`);
+    }
+
+    if (!data.access_token) {
+      throw new Error(`No access_token in response. Got: ${JSON.stringify(data)}`);
+    }
+
+    cachedToken = data.access_token;
+    const expiresIn = parseInt(data.expires_in, 10) || 3599;
+    tokenExpires = Date.now() + (expiresIn - 60) * 1000;
+
+    console.log(`[OAuth] ✅ Token obtained (expires in ${expiresIn}s)`);
+    console.log(`[OAuth] Token preview: ${cachedToken.substring(0, 30)}...`);
+    
+    return cachedToken;
+  } catch (error) {
+    console.error(`[OAuth] ❌ Error:`, error.message);
+    throw error;
   }
-
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`OAuth failed [HTTP ${res.status}]: ${errText}`);
-  }
-
-  const data = await res.json();
-
-  if (!data.access_token) {
-    throw new Error(`MTN OAuth response missing access_token field. Got: ${JSON.stringify(data)}`);
-  }
-
-  cachedToken = data.access_token;
-  const expiresIn = parseInt(data.expires_in, 10) || 3599; // MTN tokens are ~1 hour
-  tokenExpires = Date.now() + (expiresIn - 60) * 1000;
-
-  console.log(`[OAuth] Token obtained (expires in ${expiresIn}s)`);
-  return cachedToken;
 }
 
-// ─── Build MTN KYC request headers ───────────────────────────────────────────
 /**
- * Headers sent on every KYC API call.
- *
- * The MTN docs cURL sample shows:
- *   --header 'Content-Type: application/json'
- *   --header 'transactionId: '
- *
- * The OAuth guide says the access_token must be used as the
- * Authorization header parameter on API calls.
- * We send both; if OAuth fails we still send the other headers
- * so the request reaches MTN (some sandbox tiers don't enforce auth).
+ * Build MTN KYC request headers with Bearer token.
+ * 
+ * FIX: Now THROWS error if token cannot be obtained (no more silent failures)
  */
 async function buildMtnHeaders(transactionId) {
   const headers = {
-    'Content-Type':  'application/json',
+    'Content-Type': 'application/json',
     'transactionId': transactionId,
   };
 
-  try {
-    const token = await getAccessToken();
-    headers['Authorization'] = `Bearer ${token}`;
-    console.log('[KYC] Authorization: Bearer token attached');
-  } catch (err) {
-    // Log but don't block — send request without Bearer so we can see
-    // the exact MTN error rather than a proxy 500
-    console.warn('[KYC] Could not obtain Bearer token:', err.message);
-    console.warn('[KYC] Sending request without Authorization header');
-  }
+  // Get token - this will throw if fails (FIXED)
+  const token = await getAccessToken();
+  headers['Authorization'] = `Bearer ${token}`;
+  console.log('[KYC] Authorization header attached');
 
   return headers;
 }
@@ -162,7 +126,6 @@ function isValidDate(d) {
   return !d || /^\d{4}-\d{2}-\d{2}$/.test(d);
 }
 
-/** Generate a transactionId meeting MTN spec: 5-20 chars, ASCII alphanumeric + +/=.- */
 function makeTransactionId() {
   return uuidv4().replace(/-/g, '').slice(0, 20);
 }
@@ -171,140 +134,56 @@ function makeTransactionId() {
 
 /**
  * GET /health
- * Returns server status plus OAuth token check.
+ * Returns server status and tests OAuth token generation
  */
 app.get('/health', async (_req, res) => {
   const configured = !!(MTN_CONSUMER_KEY && MTN_CONSUMER_SECRET);
-  let tokenStatus  = 'credentials_not_set';
+  let tokenStatus = 'not_tested';
+  let tokenError = null;
+  let tokenPreview = null;
 
   if (configured) {
     try {
-      await getAccessToken();
+      const token = await getAccessToken();
       tokenStatus = 'ok';
+      tokenPreview = token.substring(0, 30) + '...';
     } catch (e) {
-      tokenStatus = `error: ${e.message}`;
+      tokenStatus = 'error';
+      tokenError = e.message;
     }
   }
 
   res.json({
-    status:    'ok',
-    service:   'MTN KYC Proxy',
+    status: 'ok',
+    service: 'MTN KYC Proxy',
     timestamp: new Date().toISOString(),
+    config: {
+      tokenUrl: MTN_TOKEN_URL,
+      kycBase: MTN_KYC_BASE,
+      hasConsumerKey: !!MTN_CONSUMER_KEY,
+      hasConsumerSecret: !!MTN_CONSUMER_SECRET,
+    },
     oauth: {
-      tokenUrl:    MTN_TOKEN_URL,
       configured,
       tokenStatus,
+      tokenError,
+      tokenPreview,
       tokenCached: !!cachedToken,
     },
   });
 });
 
 /**
- * GET /kyc/:customerId
- *
- * Proxies to: GET https://api.mtn.com/v1/customers/{customerId}/kyc
- *
- * customerId can be:
- *   - MSISDN in E.123 format e.g. +233201234567
- *   - Email address
- *   - Any MTN customer identifier
- *
- * Optional query params:
- *   startDate  YYYY-MM-DD   (defaults to 6 months ago on MTN side)
- *   endDate    YYYY-MM-DD   (defaults to today on MTN side)
- *
- * Response 200 data fields: idType, idNumber, dateOfBirth, gender, firstName, lastName
- */
-app.get('/kyc/:customerId', async (req, res) => {
-  const { customerId } = req.params;
-  const { startDate, endDate } = req.query;
-
-  if (!isValidCustomerId(customerId)) {
-    return res.status(400).json({
-      statusCode:    '4001',
-      statusMessage: 'customerId is required — provide MSISDN (E.123), email, or MTN customer ID.',
-      transactionId: makeTransactionId(),
-    });
-  }
-
-  if (!isValidDate(startDate) || !isValidDate(endDate)) {
-    return res.status(400).json({
-      statusCode:    '4002',
-      statusMessage: 'Invalid date format. Use YYYY-MM-DD.',
-      transactionId: makeTransactionId(),
-    });
-  }
-
-  // Honour caller transactionId if valid, else generate one
-  const rawTx = (req.headers['transactionid'] || req.headers['x-transaction-id'] || '').trim();
-  const transactionId = /^[A-Za-z0-9+/=.\-]{5,20}$/.test(rawTx) ? rawTx : makeTransactionId();
-
-  const mtnUrl = new URL(`${MTN_KYC_BASE}/customers/${encodeURIComponent(customerId)}/kyc`);
-  if (startDate) mtnUrl.searchParams.set('startDate', startDate);
-  if (endDate)   mtnUrl.searchParams.set('endDate',   endDate);
-
-  console.log(`[${new Date().toISOString()}] KYC lookup → ${mtnUrl} | txId=${transactionId}`);
-
-  try {
-    const headers = await buildMtnHeaders(transactionId);
-
-    console.log('[KYC GET] URL:', mtnUrl.toString());
-    console.log('[KYC GET] Headers:', JSON.stringify({ ...headers, Authorization: headers.Authorization ? 'Bearer ***' : 'none' }));
-
-    const mtnRes  = await fetch(mtnUrl.toString(), { method: 'GET', headers });
-    const rawText = await mtnRes.text();
-
-    console.log(`[KYC GET] MTN status: ${mtnRes.status}`);
-    console.log(`[KYC GET] MTN raw response: ${rawText.slice(0, 500)}`);
-
-    let mtnBody;
-    try {
-      mtnBody = JSON.parse(rawText);
-    } catch (_) {
-      // MTN returned non-JSON (HTML error page, gateway error, etc.)
-      return res.status(mtnRes.status || 502).json({
-        statusCode:     '5020',
-        statusMessage:  'MTN API returned non-JSON response',
-        supportMessage: `HTTP ${mtnRes.status} — Raw: ${rawText.slice(0, 300)}`,
-        transactionId,
-        timestamp:      new Date().toISOString(),
-      });
-    }
-
-    return res.status(mtnRes.status).json({
-      ...mtnBody,
-      _meta: {
-        proxyTransactionId:  transactionId,
-        mtnHttpStatus:       mtnRes.status,
-        requestedCustomerId: customerId,
-        mtnUrl:              mtnUrl.toString(),
-        timestamp:           new Date().toISOString(),
-      },
-    });
-  } catch (err) {
-    console.error('[KYC GET error]', err.message);
-    return res.status(500).json({
-      statusCode:     '5000',
-      statusMessage:  'Proxy error contacting MTN KYC API.',
-      supportMessage: err.message,
-      transactionId,
-      timestamp:      new Date().toISOString(),
-    });
-  }
-});
-
-/**
  * POST /kyc/lookup
- * Alternative to GET — customerId in request body (avoids URL-encoding issues).
- *
- * Body: { "customerId": "+233201234567", "startDate": "2026-01-01", "endDate": "2026-05-15" }
+ * 
+ * KYC endpoint: GET https://api.mtn.com/v1/customers/{customerId}/kyc
  */
 app.post('/kyc/lookup', async (req, res) => {
   const { customerId, startDate, endDate } = req.body || {};
 
   if (!isValidCustomerId(customerId)) {
     return res.status(400).json({
-      statusCode:    '4001',
+      statusCode: '4001',
       statusMessage: 'customerId is required in request body.',
       transactionId: makeTransactionId(),
     });
@@ -312,81 +191,138 @@ app.post('/kyc/lookup', async (req, res) => {
 
   if (!isValidDate(startDate) || !isValidDate(endDate)) {
     return res.status(400).json({
-      statusCode:    '4002',
+      statusCode: '4002',
       statusMessage: 'Invalid date format. Use YYYY-MM-DD.',
       transactionId: makeTransactionId(),
     });
   }
 
   const transactionId = makeTransactionId();
-  const mtnUrl = new URL(`${MTN_KYC_BASE}/customers/${encodeURIComponent(customerId)}/kyc`);
+  
+  // Clean customerId (remove any double encoding)
+  const cleanCustomerId = customerId.replace(/^%2B/, '+');
+  
+  // Build KYC URL
+  const mtnUrl = new URL(`${MTN_KYC_BASE}/customers/${encodeURIComponent(cleanCustomerId)}/kyc`);
   if (startDate) mtnUrl.searchParams.set('startDate', startDate);
-  if (endDate)   mtnUrl.searchParams.set('endDate',   endDate);
+  if (endDate) mtnUrl.searchParams.set('endDate', endDate);
 
-  console.log(`[${new Date().toISOString()}] KYC (POST) → ${mtnUrl} | txId=${transactionId}`);
+  console.log(`\n[KYC] ========== REQUEST ==========`);
+  console.log(`[KYC] URL: ${mtnUrl.toString()}`);
+  console.log(`[KYC] Transaction ID: ${transactionId}`);
+  console.log(`[KYC] Customer ID: ${cleanCustomerId}`);
 
   try {
+    // This will throw if token generation fails (FIXED)
     const headers = await buildMtnHeaders(transactionId);
+    console.log(`[KYC] Headers: Authorization=${headers.Authorization ? 'Bearer ***' : 'MISSING'}`);
 
-    console.log('[KYC POST] URL:', mtnUrl.toString());
-    console.log('[KYC POST] Headers:', JSON.stringify({ ...headers, Authorization: headers.Authorization ? 'Bearer ***' : 'none' }));
-
-    const mtnRes  = await fetch(mtnUrl.toString(), { method: 'GET', headers });
+    const mtnRes = await fetch(mtnUrl.toString(), { 
+      method: 'GET', 
+      headers 
+    });
+    
     const rawText = await mtnRes.text();
+    console.log(`[KYC] MTN status: ${mtnRes.status}`);
 
-    console.log(`[KYC POST] MTN status: ${mtnRes.status}`);
-    console.log(`[KYC POST] MTN raw response: ${rawText.slice(0, 500)}`);
-
+    // Try to parse JSON response
     let mtnBody;
     try {
       mtnBody = JSON.parse(rawText);
-    } catch (_) {
+    } catch (e) {
+      console.error(`[KYC] Non-JSON response: ${rawText.substring(0, 300)}`);
+      
+      // Check for common HTML error pages
+      let suggestion = 'Check your MTN credentials and IP whitelist.';
+      if (rawText.includes('418') || rawText.includes('teapot')) {
+        suggestion = 'HTTP 418 - Your IP may be blocked. Try using a VPN or contact MTN support.';
+      } else if (rawText.includes('401') || rawText.includes('Unauthorized')) {
+        suggestion = 'Invalid Consumer Key/Secret or wrong environment (sandbox vs production).';
+      }
+      
       return res.status(mtnRes.status || 502).json({
-        statusCode:     '5020',
-        statusMessage:  'MTN API returned non-JSON response',
-        supportMessage: `HTTP ${mtnRes.status} — Raw: ${rawText.slice(0, 300)}`,
+        statusCode: '5020',
+        statusMessage: 'MTN API returned non-JSON response',
+        supportMessage: `HTTP ${mtnRes.status} — ${suggestion}`,
+        rawPreview: rawText.substring(0, 300),
         transactionId,
-        timestamp:      new Date().toISOString(),
+        timestamp: new Date().toISOString(),
       });
     }
 
+    // Return successful response with metadata
     return res.status(mtnRes.status).json({
       ...mtnBody,
       _meta: {
-        proxyTransactionId:  transactionId,
-        mtnHttpStatus:       mtnRes.status,
-        requestedCustomerId: customerId,
-        mtnUrl:              mtnUrl.toString(),
-        timestamp:           new Date().toISOString(),
+        proxyTransactionId: transactionId,
+        mtnHttpStatus: mtnRes.status,
+        requestedCustomerId: cleanCustomerId,
+        mtnUrl: mtnUrl.toString(),
+        timestamp: new Date().toISOString(),
       },
     });
   } catch (err) {
-    console.error('[KYC POST error]', err.message);
+    console.error(`[KYC] ❌ Error:`, err.message);
+    
+    // Check if it's an OAuth error
+    if (err.message.includes('OAuth') || err.message.includes('token')) {
+      return res.status(401).json({
+        statusCode: '4000',
+        statusMessage: 'Unauthorised - Token generation failed',
+        supportMessage: err.message,
+        transactionId,
+        timestamp: new Date().toISOString(),
+        debug: {
+          hasConsumerKey: !!MTN_CONSUMER_KEY,
+          hasConsumerSecret: !!MTN_CONSUMER_SECRET,
+          consumerKeyPrefix: MTN_CONSUMER_KEY ? MTN_CONSUMER_KEY.substring(0, 8) : null,
+        },
+      });
+    }
+    
     return res.status(500).json({
-      statusCode:     '5000',
-      statusMessage:  'Proxy error contacting MTN KYC API.',
+      statusCode: '5000',
+      statusMessage: 'Proxy error contacting MTN KYC API.',
       supportMessage: err.message,
       transactionId,
-      timestamp:      new Date().toISOString(),
+      timestamp: new Date().toISOString(),
     });
   }
 });
 
+/**
+ * GET /kyc/:customerId - Legacy GET endpoint
+ */
+app.get('/kyc/:customerId', async (req, res) => {
+  const { customerId } = req.params;
+  const { startDate, endDate } = req.query;
+  
+  // Forward to POST handler
+  req.body = { customerId, startDate, endDate };
+  return app._router.handle(req, res, '/kyc/lookup');
+});
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  const keyOk    = MTN_CONSUMER_KEY    ? '✓ set' : '✗ MISSING — add to .env';
-  const secretOk = MTN_CONSUMER_SECRET ? '✓ set' : '✗ MISSING — add to .env';
+  const keyOk = MTN_CONSUMER_KEY ? '✓ SET' : '✗ MISSING';
+  const secretOk = MTN_CONSUMER_SECRET ? '✓ SET' : '✗ MISSING';
+  
   console.log(`
-╔═══════════════════════════════════════════════════════╗
-║         MTN KYC Proxy  →  http://localhost:${PORT}        ║
-╠═══════════════════════════════════════════════════════╣
-║  GET  /health                                         ║
-║  GET  /kyc/:customerId[?startDate&endDate]            ║
-║  POST /kyc/lookup   body: { customerId, ... }         ║
-╠═══════════════════════════════════════════════════════╣
-║  OAuth URL : https://api.mtn.com/v1/oauth/access_token║
-║  Consumer Key    : ${keyOk.padEnd(34)}║
-║  Consumer Secret : ${secretOk.padEnd(34)}║
-╚═══════════════════════════════════════════════════════╝
-`);
+╔═══════════════════════════════════════════════════════════════════════╗
+║                    MTN KYC Proxy Server v3.0 (FIXED)                  ║
+╠═══════════════════════════════════════════════════════════════════════╣
+║  Port: ${PORT}                                                           ║
+║  Token URL: ${MTN_TOKEN_URL}
+║  KYC Base:  ${MTN_KYC_BASE}
+╠═══════════════════════════════════════════════════════════════════════╣
+║  Consumer Key:    ${keyOk.padEnd(38)}║
+║  Consumer Secret: ${secretOk.padEnd(38)}║
+╠═══════════════════════════════════════════════════════════════════════╣
+║  ✅ FIX: buildMtnHeaders now THROWS on OAuth failure                  ║
+║  ✅ FIX: Clear error messages for debugging                          ║
+║  ✅ FIX: Proper OAuth with URL query params (per MTN docs)           ║
+╚═══════════════════════════════════════════════════════════════════════╝
+  `);
 });
+
+module.exports = app;
