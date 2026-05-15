@@ -46,15 +46,16 @@ let tokenExpires = 0; // epoch ms
 /**
  * Fetches a Bearer access_token from MTN using Client Credentials grant.
  *
- * Per the MTN docs the curl call is:
+ * Credentials are sent in the POST body (NOT as URL query params).
+ * MTN gateway returns HTTP 401 / faultMessage "Client identifier is required"
+ * if client_id is passed as a URL param instead of in the body.
+ *
  *   curl -X POST \
  *     -H "Content-Type: application/x-www-form-urlencoded" \
- *     "https://api.mtn.com/v1/oauth/access_token \
- *      ?grant_type=client_credentials \
- *      &client_id={consumer-key} \
- *      &client_secret={consumer-secret}"
+ *     --data "grant_type=client_credentials&client_id=KEY&client_secret=SECRET" \
+ *     https://api.mtn.com/v1/oauth/access_token
  *
- * Tokens are cached and refreshed 60 s before they expire.
+ * Tokens are cached and refreshed 60 s before expiry.
  */
 async function getAccessToken() {
   if (cachedToken && Date.now() < tokenExpires) return cachedToken;
@@ -66,18 +67,22 @@ async function getAccessToken() {
     );
   }
 
-  // Build URL — credentials go as query params (matching the documented cURL)
-  const tokenUrl = new URL(MTN_TOKEN_URL);
-  tokenUrl.searchParams.set('grant_type',    'client_credentials');
-  tokenUrl.searchParams.set('client_id',     MTN_CONSUMER_KEY);
-  tokenUrl.searchParams.set('client_secret', MTN_CONSUMER_SECRET);
+  // Credentials go in the POST body as application/x-www-form-urlencoded.
+  // MTN's API gateway rejects query-param credentials on POST requests —
+  // the faultMessage 'Client identifier is required, invalid_client' confirms
+  // client_id was not received when sent as a URL param.
+  const tokenBody = new URLSearchParams({
+    grant_type:    'client_credentials',
+    client_id:     MTN_CONSUMER_KEY,
+    client_secret: MTN_CONSUMER_SECRET,
+  });
 
-  console.log(`[OAuth] Fetching access token…`);
+  console.log('[OAuth] Fetching access token...');
 
-  const res = await fetch(tokenUrl.toString(), {
+  const res = await fetch(MTN_TOKEN_URL, {
     method:  'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body:    '', // params are in the URL per MTN docs
+    body:    tokenBody.toString(),
   });
 
   if (!res.ok) {
