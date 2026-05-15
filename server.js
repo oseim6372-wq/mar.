@@ -67,23 +67,39 @@ async function getAccessToken() {
     );
   }
 
-  // Credentials go in the POST body as application/x-www-form-urlencoded.
-  // MTN's API gateway rejects query-param credentials on POST requests —
-  // the faultMessage 'Client identifier is required, invalid_client' confirms
-  // client_id was not received when sent as a URL param.
+  // MTN OAuth supports two auth styles depending on subscription tier.
+  // We try Basic Auth first (client_id:client_secret as Base64 in Authorization header)
+  // then fall back to body params if that also fails.
+  // The cURL from the docs shows body params but some MTN gateway configs require Basic Auth.
   const tokenBody = new URLSearchParams({
     grant_type:    'client_credentials',
     client_id:     MTN_CONSUMER_KEY,
     client_secret: MTN_CONSUMER_SECRET,
   });
 
-  console.log('[OAuth] Fetching access token...');
+  const basicCredentials = Buffer.from(`${MTN_CONSUMER_KEY}:${MTN_CONSUMER_SECRET}`).toString('base64');
 
-  const res = await fetch(MTN_TOKEN_URL, {
+  console.log('[OAuth] Fetching access token (trying Basic Auth)...');
+
+  // Attempt 1: HTTP Basic Auth header (common for MTN gateway)
+  let res = await fetch(MTN_TOKEN_URL, {
     method:  'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body:    tokenBody.toString(),
+    headers: {
+      'Content-Type':  'application/x-www-form-urlencoded',
+      'Authorization': `Basic ${basicCredentials}`,
+    },
+    body: new URLSearchParams({ grant_type: 'client_credentials' }).toString(),
   });
+
+  // Attempt 2: credentials in body (no Basic Auth header)
+  if (!res.ok) {
+    console.log(`[OAuth] Basic Auth got ${res.status}, retrying with body params...`);
+    res = await fetch(MTN_TOKEN_URL, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:    tokenBody.toString(),
+    });
+  }
 
   if (!res.ok) {
     const errText = await res.text();
@@ -104,20 +120,37 @@ async function getAccessToken() {
   return cachedToken;
 }
 
-// ─── Build MTN request headers ────────────────────────────────────────────────
+// ─── Build MTN KYC request headers ───────────────────────────────────────────
 /**
- * Mandatory headers per MTN docs:
- *   Authorization: Bearer {access_token}   ← from OAuth flow
- *   transactionId: {unique-id}             ← 5-20 alphanumeric chars
- *   Content-Type: application/json
+ * Headers sent on every KYC API call.
+ *
+ * The MTN docs cURL sample shows:
+ *   --header 'Content-Type: application/json'
+ *   --header 'transactionId: '
+ *
+ * The OAuth guide says the access_token must be used as the
+ * Authorization header parameter on API calls.
+ * We send both; if OAuth fails we still send the other headers
+ * so the request reaches MTN (some sandbox tiers don't enforce auth).
  */
 async function buildMtnHeaders(transactionId) {
-  const token = await getAccessToken();
-  return {
+  const headers = {
     'Content-Type':  'application/json',
-    'Authorization': `Bearer ${token}`,
     'transactionId': transactionId,
   };
+
+  try {
+    const token = await getAccessToken();
+    headers['Authorization'] = `Bearer ${token}`;
+    console.log('[KYC] Authorization: Bearer token attached');
+  } catch (err) {
+    // Log but don't block — send request without Bearer so we can see
+    // the exact MTN error rather than a proxy 500
+    console.warn('[KYC] Could not obtain Bearer token:', err.message);
+    console.warn('[KYC] Sending request without Authorization header');
+  }
+
+  return headers;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
