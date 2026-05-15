@@ -11,7 +11,7 @@
  *   Authorization: Bearer {access_token}
  *
  * KYC endpoint:
- *   GET https://api.mtn.com/v1/customers/customers/{customerId}/kyc
+ *   GET https://api.mtn.com/v1/customers/{customerId}/kyc
  *
  * Setup:
  *   npm install express cors dotenv uuid
@@ -31,7 +31,7 @@ app.use(express.json());
 // ─── Config ───────────────────────────────────────────────────────────────────
 // Hardcoded per MTN Developer Portal documentation
 const MTN_TOKEN_URL = 'https://api.mtn.com/v1/oauth/access_token';
-const MTN_KYC_BASE  = 'https://api.mtn.com/v1/customers';
+const MTN_KYC_BASE  = 'https://api.mtn.com/v1'; // KYC endpoint: /customers/{customerId}/kyc
 
 // From your MTN Developer Portal subscription — now correctly named Consumer Key / Secret
 const MTN_CONSUMER_KEY    = process.env.MTN_CONSUMER_KEY    || '';
@@ -202,7 +202,7 @@ app.get('/health', async (_req, res) => {
 /**
  * GET /kyc/:customerId
  *
- * Proxies to: GET https://api.mtn.com/v1/customers/customers/{customerId}/kyc
+ * Proxies to: GET https://api.mtn.com/v1/customers/{customerId}/kyc
  *
  * customerId can be:
  *   - MSISDN in E.123 format e.g. +233201234567
@@ -381,7 +381,7 @@ app.listen(PORT, () => {
 ║         MTN KYC Proxy  →  http://localhost:${PORT}        ║
 ╠═══════════════════════════════════════════════════════╣
 ║  GET  /health                                         ║
-║  GET  /kyc/:customerId?startDate=...&endDate=...      ║
+║  GET  /kyc/:customerId[?startDate&endDate]            ║
 ║  POST /kyc/lookup   body: { customerId, ... }         ║
 ╠═══════════════════════════════════════════════════════╣
 ║  OAuth URL : https://api.mtn.com/v1/oauth/access_token║
