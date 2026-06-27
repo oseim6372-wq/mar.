@@ -1,5 +1,59 @@
-node_modules/
+# Environment variables (DO NOT COMMIT!)
 .env
-firebase-service-account.json
-*.log
+.env.local
+.env.*.local
+.env.production
+.env.development
+
+# Node modules
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# Production builds
+dist/
+build/
+*.min.js
+*.min.css
+
+# OS files
 .DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.iml
+.project
+.classpath
+.settings/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Firebase service account (if downloaded as file)
+serviceAccountKey.json
+*-firebase-adminsdk-*.json
+*.key
+*.pem
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Coverage directory
+coverage/
+
+# Environment specific
+.env.test
+.env.production.local
+.env.test.local
+.env.development.local
