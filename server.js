@@ -1,7 +1,8 @@
 // ============================================================
-//  DATEFLOW GH — UNIFIED BACKEND (PRODUCTION READY)
-//  MTN/Telecel/AT → RemaData API (local format 0XXXXXXXXX + volume mapping)
-//  Features: Retry logic, queue, memory protection, SECURE
+//  DATEFLOW GH — UNIFIED BACKEND (NO PUBLIC FOLDER NEEDED)
+//  Frontend is served directly from the server
+//  MTN/Telecel/AT → RemaData API
+//  Features: Retry logic, queue, memory protection, rate limiting
 // ============================================================
 
 require("dotenv").config();
@@ -10,8 +11,6 @@ const axios = require("axios");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const crypto = require("crypto");
-const path = require("path");
-const fs = require("fs");
 const rateLimit = require("express-rate-limit");
 
 const app = express();
@@ -22,16 +21,16 @@ const PORT = process.env.PORT || 3000;
 // ─────────────────────────────────────────────
 
 const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // Limit each IP to 100 requests per windowMs
+    windowMs: 15 * 60 * 1000,
+    max: 100,
     message: { status: "error", message: "Too many requests, please try again later." },
     standardHeaders: true,
     legacyHeaders: false,
 });
 
 const strictLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, // 1 hour
-    max: 10, // Stricter limit for sensitive endpoints
+    windowMs: 60 * 60 * 1000,
+    max: 10,
     message: { status: "error", message: "Too many requests, please try again later." },
 });
 
@@ -41,37 +40,28 @@ const strictLimiter = rateLimit({
 
 const REMADATA_API_URL = "https://remadata.com/api";
 const REMADATA_API_KEY = process.env.REMADATA_API_KEY || "";
-
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY || "";
 const DELIVER_SECRET = process.env.DELIVER_SECRET || "";
 
-// Allowed frontend domains (CORS) - MUST be set in production
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "").split(",").filter(Boolean);
-
-// If no origins specified, DENY all (strict mode)
 const CORS_ORIGIN = ALLOWED_ORIGINS.length > 0 ? ALLOWED_ORIGINS : [];
 
-// Retry configuration
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
 
-// Processed references with memory protection
 const processedRefs = new Map();
 const REF_TTL = 24 * 60 * 60 * 1000;
 const MAX_REF_SIZE = 10000;
 
-// Firebase failed saves queue
 const failedSaveQueue = [];
 let isProcessingQueue = false;
 
-// Network providers - all via RemaData
 const NETWORK_PROVIDER = {
     mtn: { name: "RemaData", primary: true },
     telecel: { name: "RemaData", primary: true },
     airteltigo: { name: "RemaData", primary: true },
 };
 
-// Promise cache for profit settings
 let profitSettingsPromise = null;
 let profitSettingsCache = null;
 let lastCacheUpdate = 0;
@@ -119,16 +109,13 @@ function getCustomerFriendlyMessage(network, technicalDetails) {
         telecel: "Telecel data delivery is temporarily unavailable. Please try again in a few minutes. If the issue persists, contact support.",
         airteltigo: "AirtelTigo data delivery is temporarily unavailable. Please try again in a few minutes. If the issue persists, contact support."
     };
-
     const baseMessage = messages[network] || "Data delivery is temporarily unavailable. Please try again later.";
-
     console.error(`📝 Technical details for ${network}: ${technicalDetails}`);
-
     return baseMessage;
 }
 
 // ─────────────────────────────────────────────
-//  RETRY LOGIC WITH EXPONENTIAL BACKOFF
+//  RETRY LOGIC
 // ─────────────────────────────────────────────
 
 async function fetchWithRetry(apiCall, retries = MAX_RETRIES, delay = RETRY_DELAY_MS) {
@@ -138,9 +125,7 @@ async function fetchWithRetry(apiCall, retries = MAX_RETRIES, delay = RETRY_DELA
         } catch (err) {
             const isLastAttempt = i === retries - 1;
             const isProviderError = err.category === "PROVIDER";
-
             if (isLastAttempt || !isProviderError) throw err;
-
             const waitTime = delay * Math.pow(2, i);
             console.log(`🔄 Retry ${i + 1}/${retries} after ${waitTime}ms: ${err.message}`);
             await new Promise(resolve => setTimeout(resolve, waitTime));
@@ -195,7 +180,6 @@ try {
         });
         db = admin.database();
         console.log("✅ Firebase Admin initialised");
-
         setInterval(processFailedSaveQueue, 60000);
     } else {
         if (!serviceAccount) console.warn("⚠️  FIREBASE_SERVICE_ACCOUNT_JSON not set — Firebase disabled");
@@ -215,7 +199,6 @@ async function saveOrderWithRetry(ref, payload, retries = 5) {
         console.warn(`⚠️ Firebase unavailable, queued order "${ref}" (queue size: ${failedSaveQueue.length})`);
         return;
     }
-
     for (let i = 0; i < retries; i++) {
         try {
             await db.ref(`transactions/${ref}`).set(payload);
@@ -244,13 +227,10 @@ async function saveFailedOrderWithRetry(ref, payload, errMessage) {
 
 async function processFailedSaveQueue() {
     if (isProcessingQueue || !db || failedSaveQueue.length === 0) return;
-
     isProcessingQueue = true;
     console.log(`🔄 Processing ${failedSaveQueue.length} queued Firebase saves...`);
-
     const queueCopy = [...failedSaveQueue];
     failedSaveQueue.length = 0;
-
     for (const item of queueCopy) {
         try {
             await db.ref(`transactions/${item.ref}`).set(item.payload);
@@ -260,29 +240,25 @@ async function processFailedSaveQueue() {
             failedSaveQueue.push(item);
         }
     }
-
     isProcessingQueue = false;
-
     if (failedSaveQueue.length > 0) {
         setTimeout(processFailedSaveQueue, 30000);
     }
 }
 
 // ─────────────────────────────────────────────
-//  PROCESSED REFS CLEANUP (Memory Protection)
+//  PROCESSED REFS CLEANUP
 // ─────────────────────────────────────────────
 
 setInterval(() => {
     const now = Date.now();
     let deletedCount = 0;
-
     for (const [ref, timestamp] of processedRefs.entries()) {
         if (now - timestamp > REF_TTL) {
             processedRefs.delete(ref);
             deletedCount++;
         }
     }
-
     if (processedRefs.size > MAX_REF_SIZE) {
         const excess = processedRefs.size - MAX_REF_SIZE;
         const iterator = processedRefs.keys();
@@ -291,7 +267,6 @@ setInterval(() => {
         }
         console.warn(`⚠️ Force-cleaned ${excess} old refs, size now ${processedRefs.size}`);
     }
-
     if (deletedCount > 0) {
         console.log(`🧹 Cleaned ${deletedCount} expired refs, size: ${processedRefs.size}`);
     }
@@ -303,16 +278,11 @@ setInterval(() => {
 
 const corsOptions = {
     origin: function(origin, callback) {
-        // Allow requests with no origin (like mobile apps, curl, etc.)
         if (!origin) return callback(null, true);
-
-        // If no origins configured, deny all
         if (CORS_ORIGIN.length === 0) {
             console.warn(`⚠️ CORS blocked request from: ${origin} - No origins configured`);
             return callback(new AppError('CORS policy blocked this request', 403, 'CORS'));
         }
-
-        // Check if origin is allowed
         if (CORS_ORIGIN.indexOf(origin) !== -1) {
             callback(null, true);
         } else {
@@ -383,36 +353,2014 @@ function requireApiKey(req, res, next) {
     next();
 }
 
-// ─────────────────────────────────────────────
-//  SERVE FRONTEND (WITHOUT SENSITIVE CONFIG)
-// ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+//  ⭐ FRONTEND HTML - EMBEDDED DIRECTLY IN SERVER (NO PUBLIC FOLDER NEEDED)
+// ═══════════════════════════════════════════════════════════════════════════
 
-app.use(express.static(path.join(__dirname, 'public')));
+// This is the complete frontend HTML - copy your full index.html here
+// I've included a minimal version, but you should replace with your full frontend
+const FRONTEND_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>DataFlow GH | Instant Data Bundles</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cabinet+Grotesk:wght@400;500;700;800;900&family=Epilogue:ital,wght@0,300;0,400;0,500;1,300&display=swap" rel="stylesheet">
+<script src="https://js.paystack.co/v1/inline.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-database-compat.js"></script>
+<style>
+:root {
+  --bg: #06060A; --surface: #0E0E15; --card: #13131C; --border: #1E1E2E; --text: #E8E8F0;
+  --text-light: #E8E8F0; --text-dark: #1A1A2E; --muted: #5A5A78; --muted-light: #6B6B8D;
+  --faint: #22223A; --faint-light: #E8E8F0; --card-hover: rgba(255,255,255,.03);
+  --shadow: rgba(0,0,0,.5); --glow-opacity: .07; --mtn: #FFCC00; --tel: #E8212A;
+  --at: #007DC5; --active: var(--mtn); --green: #00D98B; --red: #FF4455; --orange: #FF9500;
+  --radius: 18px; --r-sm: 10px; --whatsapp: #25D366;
+  --card-gradient-start: #13131C;
+  --card-gradient-end: #0E0E15;
+  --card-bg: #13131C;
+}
+[data-theme="light"] { 
+  --bg: #F5F5F7; --surface: #FFFFFF; --card: #FFFFFF; --border: #E0E0E8; --text: #1A1A2E; 
+  --muted: #6B6B8D; --faint: #EEEEF3; --card-hover: rgba(0,0,0,.02); --shadow: rgba(0,0,0,.08); 
+  --glow-opacity: .03;
+  --card-gradient-start: #FFFFFF;
+  --card-gradient-end: #F5F5F7;
+  --card-bg: #FFFFFF;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; min-height: 100vh; overflow-x: hidden; transition: background-color 0.3s ease, color 0.3s ease; }
+body { font-family: 'Epilogue', sans-serif; background: var(--bg); color: var(--text); position: relative; transition: background-color 0.3s ease, color 0.3s ease; }
+body::before { content: ''; position: fixed; inset: 0; width: 100%; height: 100%; background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='1'/%3E%3C/svg%3E"); opacity: 0.025; pointer-events: none; z-index: 0; transition: opacity 0.3s ease; }
+[data-theme="light"] body::before { opacity: 0.008; }
+.container-full { width: 100%; max-width: 1400px; margin: 0 auto; padding: 0 2rem; }
+nav { position: sticky; top: 0; z-index: 200; width: 100%; display: flex; justify-content: space-between; align-items: center; padding: 1rem 2.5rem; background: rgba(6,6,10,.92); backdrop-filter: blur(20px); border-bottom: 1px solid var(--border); transition: background 0.3s ease, border-color 0.3s ease; }
+[data-theme="light"] nav { background: rgba(255,255,255,.92); }
+.logo { font-family: 'Cabinet Grotesk', sans-serif; font-weight: 900; font-size: 1.5rem; letter-spacing: -1px; color: var(--mtn); display: flex; align-items: center; gap: .5rem; }
+.logo-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--mtn); box-shadow: 0 0 10px var(--mtn); animation: pulse-dot 2s ease-in-out infinite; }
+@keyframes pulse-dot { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.4;transform:scale(.7)} }
+.nav-links { display: flex; gap: 2rem; align-items: center; }
+.nav-links a { color: var(--muted); text-decoration: none; font-size: .9rem; font-weight: 500; transition: color .2s; }
+.nav-links a:hover { color: var(--text); }
+.nav-cta { background: var(--mtn); color: black !important; font-weight: 700 !important; font-size: .85rem !important; padding: .5rem 1.2rem; border-radius: 10px; }
+.nav-cta:hover { background: #fff !important; }
+.theme-toggle { background: var(--faint); border: 1px solid var(--border); border-radius: 40px; padding: 0.3rem; cursor: pointer; display: flex; align-items: center; gap: 0.4rem; transition: all 0.3s ease; }
+.theme-toggle:hover { border-color: var(--mtn); transform: scale(1.02); }
+.toggle-icon { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 0.9rem; transition: all 0.3s ease; background: transparent; }
+.toggle-icon.active { background: var(--mtn); color: #06060A; box-shadow: 0 0 8px var(--mtn); }
+.toggle-icon:not(.active) { color: var(--muted); }
+.notification-bell {
+  position: fixed;
+  top: 90px;
+  right: 20px;
+  z-index: 1000;
+  cursor: pointer;
+}
+.bell-icon {
+  width: 48px;
+  height: 48px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.5rem;
+  position: relative;
+  transition: all 0.2s;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+.bell-icon:hover {
+  transform: scale(1.05);
+  border-color: var(--mtn);
+}
+.notification-badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  background: var(--red);
+  color: white;
+  font-size: 0.65rem;
+  font-weight: bold;
+  padding: 2px 6px;
+  border-radius: 20px;
+  min-width: 20px;
+  text-align: center;
+}
+.notification-panel {
+  position: fixed;
+  top: 150px;
+  right: 20px;
+  width: 360px;
+  max-width: calc(100vw - 40px);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  z-index: 1000;
+  display: none;
+  flex-direction: column;
+  max-height: 500px;
+  overflow: hidden;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.4);
+  animation: slideDown 0.25s ease;
+}
+@keyframes slideDown {
+  from { opacity: 0; transform: translateY(-20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.notification-panel.open {
+  display: flex;
+}
+.notif-panel-header {
+  padding: 1rem;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 800;
+}
+.notif-panel-header h3 {
+  font-family: 'Cabinet Grotesk', sans-serif;
+  font-size: 1rem;
+}
+.close-panel {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 1.2rem;
+  cursor: pointer;
+}
+.notif-list {
+  overflow-y: auto;
+  max-height: 400px;
+  padding: 0.5rem;
+}
+.notif-item {
+  padding: 0.8rem;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.2s;
+  border-radius: 12px;
+  margin-bottom: 0.3rem;
+}
+.notif-item:hover {
+  background: var(--faint);
+}
+.notif-item.unread {
+  background: rgba(255,204,0,.05);
+  border-left: 3px solid var(--mtn);
+}
+.notif-type-badge {
+  font-size: 0.6rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 12px;
+  display: inline-block;
+  margin-bottom: 0.4rem;
+}
+.notif-type-badge.info { background: rgba(77,158,255,.15); color: #4D9EFF; }
+.notif-type-badge.success { background: rgba(0,217,139,.15); color: var(--green); }
+.notif-type-badge.warning { background: rgba(255,149,0,.15); color: var(--orange); }
+.notif-type-badge.urgent { background: rgba(255,68,85,.15); color: var(--red); }
+.notif-title {
+  font-weight: 700;
+  font-size: 0.85rem;
+  margin-bottom: 0.2rem;
+}
+.notif-message {
+  font-size: 0.75rem;
+  color: var(--muted);
+  line-height: 1.4;
+}
+.notif-time {
+  font-size: 0.6rem;
+  color: var(--muted);
+  margin-top: 0.3rem;
+}
+.empty-notif {
+  text-align: center;
+  padding: 2rem;
+  color: var(--muted);
+}
+.toast-popup {
+  position: fixed;
+  top: 100px;
+  right: 80px;
+  background: var(--card);
+  border-left: 4px solid var(--mtn);
+  border-radius: 12px;
+  padding: 0.8rem 1rem;
+  max-width: 320px;
+  z-index: 1002;
+  animation: slideInRight 0.3s ease;
+  box-shadow: 0 8px 20px rgba(0,0,0,0.3);
+  cursor: pointer;
+}
+@keyframes slideInRight {
+  from { transform: translateX(100px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+.toast-popup.hide {
+  animation: fadeOut 0.3s ease forwards;
+}
+@keyframes fadeOut {
+  to { opacity: 0; transform: translateX(100px); }
+}
+.toast-title {
+  font-weight: 800;
+  font-size: 0.8rem;
+  margin-bottom: 0.2rem;
+}
+.toast-msg {
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+.maintenance-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  backdrop-filter: blur(16px);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+  flex-direction: column;
+  gap: 1.5rem;
+  text-align: center;
+  animation: fadeInScale 0.4s ease;
+}
+@keyframes fadeInScale {
+  from { opacity: 0; transform: scale(0.98); }
+  to { opacity: 1; transform: scale(1); }
+}
+.maintenance-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 32px;
+  padding: 2.5rem;
+  max-width: 550px;
+  width: 100%;
+  box-shadow: 0 25px 50px rgba(0,0,0,0.5);
+}
+.maintenance-icon {
+  font-size: 4rem;
+  margin-bottom: 1rem;
+}
+.maintenance-title {
+  font-family: 'Cabinet Grotesk', sans-serif;
+  font-size: 2rem;
+  font-weight: 900;
+  color: var(--mtn);
+  margin-bottom: 0.5rem;
+}
+.maintenance-message {
+  color: var(--text);
+  font-size: 1rem;
+  line-height: 1.6;
+  margin: 1rem 0;
+}
+.maintenance-estimate {
+  background: rgba(255,204,0,0.1);
+  padding: 0.8rem;
+  border-radius: 20px;
+  font-size: 0.85rem;
+  display: inline-block;
+  margin-top: 0.5rem;
+  color: var(--mtn);
+  font-weight: 600;
+}
+.social-links-maint {
+  display: flex;
+  gap: 1.5rem;
+  justify-content: center;
+  margin-top: 1.5rem;
+}
+.social-links-maint a {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 0.85rem;
+  transition: color 0.2s;
+}
+.social-links-maint a:hover {
+  color: var(--mtn);
+}
+.whatsapp-float {
+  position: fixed;
+  bottom: 28px;
+  left: 28px;
+  background-color: #25D366;
+  color: white;
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 6px 20px rgba(37, 211, 102, 0.4);
+  transition: all 0.25s ease-in-out;
+  z-index: 1100;
+  text-decoration: none;
+  cursor: pointer;
+  border: none;
+  backdrop-filter: blur(2px);
+}
+.whatsapp-float svg {
+  width: 34px;
+  height: 34px;
+  filter: drop-shadow(0 1px 2px rgba(0,0,0,0.1));
+}
+.whatsapp-float:hover {
+  transform: scale(1.1);
+  background-color: #20b859;
+  box-shadow: 0 10px 25px rgba(37, 211, 102, 0.6);
+}
+.whatsapp-float:active {
+  transform: scale(0.98);
+}
+@keyframes wa-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(37, 211, 102, 0.5); }
+  70% { box-shadow: 0 0 0 14px rgba(37, 211, 102, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(37, 211, 102, 0); }
+}
+.whatsapp-float {
+  animation: wa-pulse 1.8s infinite;
+}
+@media (max-width: 640px) {
+  .whatsapp-float {
+    bottom: 20px;
+    left: 20px;
+    width: 52px;
+    height: 52px;
+  }
+  .whatsapp-float svg {
+    width: 28px;
+    height: 28px;
+  }
+}
+.whatsapp-float::after {
+  content: "Join WhatsApp";
+  position: absolute;
+  left: 70px;
+  background: var(--card);
+  color: var(--text);
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 5px 10px;
+  border-radius: 30px;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+  border: 1px solid var(--border);
+  font-family: 'Cabinet Grotesk', sans-serif;
+  letter-spacing: -0.2px;
+}
+.whatsapp-float:hover::after {
+  opacity: 1;
+}
+@media (max-width: 480px) {
+  .whatsapp-float::after {
+    display: none;
+  }
+}
+.hero-wrap { position: relative; width: 100%; max-width: 1400px; margin: 0 auto; padding: 5rem 2.5rem; display: grid; grid-template-columns: 1fr 420px; gap: 4rem; align-items: center; }
+.hero-wrap::before { content: ''; position: absolute; top: -80px; left: 50%; transform: translateX(-50%); width: 80vw; max-width: 800px; height: 400px; background: radial-gradient(ellipse at 50% 50%, rgba(255,204,0,var(--glow-opacity)) 0%, transparent 65%); pointer-events: none; z-index: -1; transition: opacity 0.3s ease; }
+.hero-tag { display: inline-flex; align-items: center; gap: .5rem; background: rgba(255,204,0,.06); border: 1px solid rgba(255,204,0,.2); color: var(--mtn); font-size: .75rem; font-weight: 700; letter-spacing: 1.2px; text-transform: uppercase; padding: .4rem 1.1rem; border-radius: 30px; margin-bottom: 1.5rem; }
+.blink { width: 5px; height: 5px; border-radius: 50%; background: var(--mtn); animation: pulse-dot 1.4s ease infinite; }
+.hero h1 { font-family: 'Cabinet Grotesk', sans-serif; font-size: 4rem; font-weight: 900; line-height: 1.05; letter-spacing: -2px; margin-bottom: 1.2rem; }
+.h1-mtn { color: var(--mtn); }
+.h1-tel { color: var(--tel); }
+.h1-at { color: var(--at); }
+.hero-desc { color: var(--muted); font-size: 1rem; line-height: 1.8; max-width: 480px; margin-bottom: 2.4rem; }
+.hero-stats { display: flex; gap: 2.5rem; }
+.stat-val { font-family: 'Cabinet Grotesk', sans-serif; font-size: 1.8rem; font-weight: 900; color: var(--text); line-height: 1; }
+.stat-lbl { font-size: .75rem; color: var(--muted); margin-top: .2rem; }
+.hero-panel { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.8rem; position: relative; overflow: hidden; transition: background 0.3s ease, border-color 0.3s ease; }
+.hero-panel::before { content: ''; position: absolute; top: -50px; right: -50px; width: 200px; height: 200px; background: radial-gradient(circle, rgba(255,204,0,.08) 0%, transparent 70%); pointer-events: none; }
+.panel-label { font-size: .7rem; color: var(--muted); letter-spacing: 1.2px; text-transform: uppercase; margin-bottom: .5rem; }
+.panel-title { font-family: 'Cabinet Grotesk', sans-serif; font-size: 1.5rem; font-weight: 800; margin-bottom: 1.4rem; }
+.signal-bars { display: flex; gap: 4px; align-items: flex-end; margin-bottom: 1.4rem; }
+.bar { width: 12px; border-radius: 3px; }
+.bar-1 { height:10px; } .bar-2 { height:18px; } .bar-3 { height:28px; } .bar-4 { height:40px; } .bar-5 { height:54px; }
+.panel-row { display: flex; justify-content: space-between; align-items: center; padding: .7rem 0; border-bottom: 1px solid var(--border); font-size: .85rem; }
+.panel-row:last-child { border-bottom: none; }
+.panel-row .label { color: var(--muted); }
+.badge-ok { color: var(--green); font-weight: 700; }
+.badge-network { font-weight: 700; font-size: .75rem; padding: .2rem .6rem; border-radius: 5px; }
+.badge-mtn { background: rgba(255,204,0,.12); color: var(--mtn); }
+.badge-tel { background: rgba(232,33,42,.1); color: var(--tel); }
+.badge-at { background: rgba(0,125,197,.12); color: var(--at); }
+.divider { border: none; border-top: 1px solid var(--border); width: 100%; transition: border-color 0.3s ease; }
+.section { width: 100%; max-width: 1400px; margin: 0 auto; padding: 5rem 2.5rem; }
+.sec-title { font-family: 'Cabinet Grotesk', sans-serif; font-size: 2.2rem; font-weight: 900; letter-spacing: -.5px; }
+.sec-sub { color: var(--muted); font-size: .9rem; margin-top: .5rem; }
+.sec-head { margin-bottom: 3rem; }
+.tabs { display: flex; gap: .8rem; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: .5rem; width: fit-content; margin-bottom: 2.5rem; transition: background 0.3s ease, border-color 0.3s ease; }
+.tab-btn { padding: .6rem 1.6rem; border: none; border-radius: 10px; background: transparent; color: var(--muted); font-family: 'Cabinet Grotesk', sans-serif; font-size: .9rem; font-weight: 700; cursor: pointer; transition: all .25s; display: flex; align-items: center; gap: .5rem; }
+.tab-btn .pip { width: 7px; height: 7px; border-radius: 50%; }
+.tab-btn.active-mtn { background: rgba(255,204,0,.14); color: var(--mtn); }
+.tab-btn.active-tel { background: rgba(232,33,42,.12); color: var(--tel); }
+.tab-btn.active-at { background: rgba(0,125,197,.14); color: var(--at); }
+.bundles-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1.5rem; width: 100%; }
+.bundle-panel { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.6rem; cursor: pointer; position: relative; overflow: hidden; transition: transform .2s, box-shadow .2s, border-color .2s, background 0.3s ease; animation: fadeUp .35s ease both; }
+@keyframes fadeUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+.bundle-panel:hover { transform: translateY(-5px); border-color: var(--active); box-shadow: 0 18px 50px var(--shadow), 0 0 0 1px var(--active); }
+.bundle-panel.hot { border-color: rgba(255,204,0,.28); }
+.hot-label { position: absolute; top: 1rem; right: 1rem; font-size: .6rem; font-weight: 800; letter-spacing: .8px; text-transform: uppercase; padding: .2rem .6rem; border-radius: 5px; }
+.bp-network { font-size: .7rem; font-weight: 700; letter-spacing: 1.4px; text-transform: uppercase; margin-bottom: .8rem; }
+.bp-size { font-family: 'Cabinet Grotesk', sans-serif; font-size: 2.8rem; font-weight: 900; line-height: 1; margin-bottom: .3rem; }
+.bp-validity { font-size: .8rem; color: var(--muted); margin-bottom: 1.2rem; }
+.bp-price { font-family: 'Cabinet Grotesk', sans-serif; font-size: 1.4rem; font-weight: 800; margin-bottom: .2rem; }
+.bp-ppgb { font-size: .7rem; color: var(--muted); margin-bottom: 1rem; }
+.bp-btn { width: 100%; padding: .75rem; background: var(--faint); border: 1px solid var(--border); border-radius: 10px; color: var(--text); font-family: 'Cabinet Grotesk', sans-serif; font-size: .85rem; font-weight: 700; cursor: pointer; transition: all .2s; }
+.bp-btn:hover { background: var(--active); border-color: var(--active); color: var(--bg); }
+.coming-soon-panel { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 2rem; text-align: center; opacity: 0.7; }
+.how-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.5rem; width: 100%; }
+.how-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 2rem; position: relative; transition: background 0.3s ease, border-color 0.3s ease; }
+.how-num { font-family: 'Cabinet Grotesk', sans-serif; font-size: 3.2rem; font-weight: 900; color: var(--faint); line-height: 1; margin-bottom: 1rem; }
+.how-card h3 { font-family: 'Cabinet Grotesk', sans-serif; font-size: 1.1rem; font-weight: 800; margin-bottom: .5rem; }
+.how-card p { color: var(--muted); font-size: .85rem; line-height: 1.7; }
+.how-icon { font-size: 1.6rem; margin-bottom: .8rem; }
+.tracking-section { width: 100%; max-width: 1400px; margin: 2rem auto 0; padding: 0 2.5rem; }
+.tracking-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 2rem; }
+.tracking-header { text-align: center; margin-bottom: 1.5rem; }
+.tracking-header h2 { font-family: 'Cabinet Grotesk', sans-serif; font-size: 1.6rem; font-weight: 800; color: var(--mtn); }
+.tracking-header p { color: var(--muted); font-size: 0.85rem; margin-top: 0.3rem; }
+.tracking-input-group { display: flex; gap: 1rem; flex-wrap: wrap; justify-content: center; margin-bottom: 2rem; }
+.tracking-input { flex: 1; min-width: 250px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 0.9rem 1.2rem; color: var(--text); font-size: 0.9rem; outline: none; transition: all 0.2s; }
+.tracking-input:focus { border-color: var(--mtn); box-shadow: 0 0 0 3px rgba(255,204,0,.1); }
+.tracking-btn { background: var(--mtn); border: none; border-radius: 12px; padding: 0.9rem 1.8rem; font-weight: 800; font-size: 0.9rem; cursor: pointer; transition: all 0.2s; color: var(--bg); }
+.tracking-btn:hover { transform: translateY(-2px); filter: brightness(1.05); }
+.order-result { display: none; margin-top: 2rem; }
+.order-card { background: var(--bg); border: 1px solid var(--border); border-radius: 16px; padding: 1.5rem; animation: fadeIn 0.3s ease; }
+.order-status-header { display: flex; align-items: center; gap: 1rem; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); }
+.status-icon { width: 48px; height: 48px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 1.5rem; }
+.status-icon.completed { background: rgba(0,217,139,.15); color: var(--green); }
+.status-icon.pending { background: rgba(255,149,0,.15); color: var(--orange); }
+.status-icon.failed { background: rgba(255,68,85,.15); color: var(--red); }
+.status-info h3 { font-family: 'Cabinet Grotesk', sans-serif; font-size: 1.1rem; font-weight: 800; }
+.status-badge { display: inline-block; padding: 0.25rem 0.8rem; border-radius: 20px; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; margin-top: 0.3rem; }
+.status-badge.completed { background: rgba(0,217,139,.15); color: var(--green); }
+.status-badge.pending { background: rgba(255,149,0,.15); color: var(--orange); }
+.status-badge.failed { background: rgba(255,68,85,.15); color: var(--red); }
+.order-details-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; }
+.detail-item { display: flex; flex-direction: column; gap: 0.2rem; }
+.detail-label { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.detail-value { font-size: 0.9rem; font-weight: 500; }
+.timeline { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+.timeline-step { display: flex; align-items: center; gap: 0.8rem; margin-bottom: 0.8rem; }
+.timeline-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+.timeline-dot.active { background: var(--green); box-shadow: 0 0 8px var(--green); }
+.timeline-dot.pending { background: var(--orange); }
+.timeline-text { font-size: 0.75rem; color: var(--muted); }
+.timeline-text.active { color: var(--text); font-weight: 500; }
+.no-order { text-align: center; padding: 2rem; color: var(--muted); }
+@media (max-width: 900px) { .tracking-section { padding: 0 1.5rem; } .tracking-input-group { flex-direction: column; } .tracking-btn { width: 100%; } }
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  background: rgba(0,0,0,0.92);
+  backdrop-filter: blur(12px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .3s;
+}
+.overlay.open {
+  opacity: 1;
+  pointer-events: all;
+}
+.modal {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 28px;
+  width: 100%;
+  max-width: 600px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+  transition: background 0.3s ease, border-color 0.3s ease;
+  box-shadow: 0 30px 60px rgba(0,0,0,0.5);
+}
+.modal-content {
+  padding: 2rem 2rem;
+  overflow-y: auto;
+  flex: 1;
+}
+.modal-glow {
+  position: absolute;
+  top: -60px;
+  right: -60px;
+  width: 250px;
+  height: 250px;
+  pointer-events: none;
+  z-index: 0;
+}
+.modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 1.8rem;
+  position: relative;
+  z-index: 1;
+}
+.modal-title {
+  font-family: 'Cabinet Grotesk', sans-serif;
+  font-size: 1.6rem;
+  font-weight: 900;
+  background: linear-gradient(135deg, var(--mtn) 0%, #FFD633 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.modal-sub {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin-top: 0.3rem;
+}
+.close-btn {
+  background: var(--faint);
+  border: none;
+  color: var(--muted);
+  width: 36px;
+  height: 36px;
+  border-radius: 12px;
+  cursor: pointer;
+  font-size: 1.1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+.close-btn:hover {
+  color: var(--text);
+  background: rgba(255,255,255,0.1);
+  transform: scale(1.02);
+}
+.order-chip {
+  background: linear-gradient(135deg, var(--bg) 0%, var(--surface) 100%);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 1.2rem 1.5rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1.5rem;
+  transition: background 0.3s ease, border-color 0.3s ease;
+}
+.chip-left .lbl {
+  font-size: 0.7rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  font-weight: 600;
+}
+.chip-left .val {
+  font-family: 'Cabinet Grotesk', sans-serif;
+  font-size: 1.6rem;
+  font-weight: 900;
+  margin-top: 0.2rem;
+  letter-spacing: -1px;
+}
+.chip-left .sub {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 0.1rem;
+}
+.chip-right .lbl {
+  font-size: 0.7rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  text-align: right;
+  font-weight: 600;
+}
+.chip-right .price {
+  font-family: 'Cabinet Grotesk', sans-serif;
+  font-size: 2rem;
+  font-weight: 900;
+  letter-spacing: -1px;
+}
+.fee-breakdown {
+  background: var(--faint);
+  border-radius: 16px;
+  padding: 1rem 1.2rem;
+  margin-bottom: 1.5rem;
+  font-size: 0.85rem;
+  border-left: 3px solid var(--green);
+}
+.fee-row {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+.fee-row.total {
+  margin-top: 0.6rem;
+  padding-top: 0.6rem;
+  border-top: 1px dashed var(--border);
+  font-weight: 800;
+  font-size: 0.9rem;
+}
+.fee-label {
+  color: var(--muted);
+}
+.fee-value {
+  font-weight: 600;
+  color: var(--text);
+}
+.field {
+  margin-bottom: 1.2rem;
+}
+.field label {
+  display: block;
+  font-size: 0.7rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 0.5rem;
+  font-weight: 600;
+}
+.field input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 0.9rem 1.2rem;
+  color: var(--text);
+  font-family: 'Epilogue', sans-serif;
+  font-size: 0.95rem;
+  outline: none;
+  transition: all 0.2s;
+}
+.field input:focus {
+  border-color: var(--active);
+  box-shadow: 0 0 0 3px rgba(255,204,0,0.1);
+}
+.pay-btn {
+  width: 100%;
+  border: none;
+  border-radius: 16px;
+  padding: 1rem;
+  font-family: 'Cabinet Grotesk', sans-serif;
+  font-size: 1rem;
+  font-weight: 900;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  margin-top: 0.5rem;
+  letter-spacing: -0.2px;
+}
+.pay-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.secure-note {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  font-size: 0.7rem;
+  color: var(--muted);
+  margin-top: 1rem;
+  margin-bottom: 0.5rem;
+}
+.warning-notice {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+  background: rgba(255, 68, 85, 0.06);
+  border: 1px solid rgba(255, 68, 85, 0.2);
+  border-left: 3px solid #FF4455;
+  border-radius: 14px;
+  padding: 0.9rem 1rem;
+  margin-bottom: 1.2rem;
+}
+.warning-icon {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #FF4455;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 900;
+  color: #fff;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.warning-text {
+  font-size: 0.78rem;
+  line-height: 1.6;
+  color: var(--text);
+  margin: 0;
+}
+.warning-text strong {
+  color: #FF4455;
+}
+@media (max-width: 640px) {
+  .modal {
+    max-width: 95%;
+    max-height: 85vh;
+  }
+  .modal-content {
+    padding: 1.5rem;
+  }
+  .modal-title {
+    font-size: 1.3rem;
+  }
+  .order-chip {
+    flex-direction: column;
+    text-align: center;
+    gap: 0.8rem;
+    padding: 1rem;
+  }
+  .chip-right .lbl {
+    text-align: center;
+  }
+  .chip-right .price {
+    font-size: 1.5rem;
+  }
+  .chip-left .val {
+    font-size: 1.3rem;
+  }
+  .fee-breakdown {
+    padding: 0.8rem 1rem;
+  }
+  .field input {
+    padding: 0.75rem 1rem;
+  }
+  .pay-btn {
+    padding: 0.85rem;
+    font-size: 0.9rem;
+  }
+}
+@media (min-width: 1024px) {
+  .modal {
+    max-width: 640px;
+  }
+  .modal-content {
+    padding: 2rem 2.2rem;
+  }
+  .chip-left .val {
+    font-size: 1.8rem;
+  }
+  .chip-right .price {
+    font-size: 2.2rem;
+  }
+}
+.success-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.88);
+  backdrop-filter: blur(20px);
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  visibility: hidden;
+  transition: all 0.35s cubic-bezier(0.2, 0.9, 0.4, 1.1);
+}
+.success-overlay.open {
+  opacity: 1;
+  visibility: visible;
+}
+.success-modal {
+  background: linear-gradient(145deg, var(--card-gradient-start) 0%, var(--card-gradient-end) 100%);
+  border-radius: 48px;
+  width: 90%;
+  max-width: 440px;
+  padding: 2rem 1.8rem;
+  text-align: center;
+  position: relative;
+  transform: scale(0.92) translateY(30px);
+  transition: transform 0.4s cubic-bezier(0.2, 0.9, 0.4, 1.1);
+  box-shadow: 0 30px 60px rgba(0,0,0,0.5), 0 0 0 1px rgba(0,217,139,0.2);
+  overflow: hidden;
+}
+.success-overlay.open .success-modal {
+  transform: scale(1) translateY(0);
+}
+.success-modal::before {
+  content: '';
+  position: absolute;
+  top: -2px;
+  left: -2px;
+  right: -2px;
+  bottom: -2px;
+  background: linear-gradient(135deg, #00D98B, #FFD700, #00D98B);
+  border-radius: 50px;
+  opacity: 0;
+  z-index: -2;
+}
+.success-modal::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--card-bg);
+  border-radius: 46px;
+  z-index: -1;
+}
+.success-icon-wrapper {
+  width: 100px;
+  height: 100px;
+  margin: 0 auto 1rem;
+}
+.success-icon-circle {
+  width: 100px;
+  height: 100px;
+  background: linear-gradient(135deg, rgba(0,217,139,0.15) 0%, rgba(0,217,139,0.05) 100%);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: pulseGlow 2s ease-in-out infinite;
+}
+.success-icon-check {
+  width: 60px;
+  height: 60px;
+  background: linear-gradient(135deg, #00D98B 0%, #00b877 100%);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: checkPop 0.6s cubic-bezier(0.34, 1.2, 0.64, 1) forwards;
+  box-shadow: 0 8px 20px rgba(0,217,139,0.4);
+}
+.success-icon-check svg {
+  width: 32px;
+  height: 32px;
+  stroke: white;
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+  animation: drawCheck 0.5s ease-out 0.2s forwards;
+  stroke-dasharray: 50;
+  stroke-dashoffset: 50;
+}
+@keyframes checkPop {
+  0% { transform: scale(0); opacity: 0; }
+  50% { transform: scale(1.1); }
+  100% { transform: scale(1); opacity: 1; }
+}
+@keyframes drawCheck {
+  to { stroke-dashoffset: 0; }
+}
+@keyframes pulseGlow {
+  0%,100% { box-shadow: 0 0 0 0 rgba(0,217,139,0.4); }
+  50% { box-shadow: 0 0 0 15px rgba(0,217,139,0); }
+}
+.success-title {
+  font-family: 'Cabinet Grotesk', sans-serif;
+  font-size: 1.8rem;
+  font-weight: 900;
+  margin-bottom: 0.5rem;
+  background: linear-gradient(135deg, #00D98B 0%, #FFD700 70%, #00D98B 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.success-bundle {
+  font-family: 'Cabinet Grotesk', sans-serif;
+  font-size: 2.8rem;
+  font-weight: 900;
+  color: var(--text);
+  margin: 0.5rem 0;
+  letter-spacing: -2px;
+  line-height: 1;
+}
+.success-message {
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin: 0.75rem 0 1rem;
+  line-height: 1.6;
+}
+.success-ref-card {
+  background: rgba(0,217,139,0.08);
+  border: 1px solid rgba(0,217,139,0.2);
+  border-radius: 20px;
+  padding: 0.8rem 1rem;
+  margin: 1rem 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+.ref-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--muted);
+}
+.ref-value {
+  font-family: 'Cabinet Grotesk', monospace;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--green);
+  background: rgba(0,0,0,0.3);
+  padding: 0.3rem 0.8rem;
+  border-radius: 30px;
+}
+.copy-ref-btn {
+  background: rgba(255,255,255,0.1);
+  border: none;
+  padding: 0.4rem 0.8rem;
+  border-radius: 30px;
+  font-size: 0.7rem;
+  cursor: pointer;
+  color: var(--text);
+  transition: all 0.2s;
+}
+.copy-ref-btn:hover {
+  background: rgba(0,217,139,0.2);
+  transform: scale(1.02);
+}
+.success-actions {
+  display: flex;
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+.btn-primary {
+  flex: 1;
+  background: linear-gradient(135deg, #00D98B 0%, #00b877 100%);
+  border: none;
+  padding: 0.9rem;
+  border-radius: 40px;
+  font-family: 'Cabinet Grotesk', sans-serif;
+  font-weight: 800;
+  font-size: 0.9rem;
+  cursor: pointer;
+  color: #06060A;
+  transition: all 0.2s;
+}
+.btn-primary:hover {
+  transform: translateY(-2px);
+  filter: brightness(1.05);
+}
+.btn-secondary {
+  flex: 1;
+  background: transparent;
+  border: 1px solid rgba(255,255,255,0.2);
+  padding: 0.9rem;
+  border-radius: 40px;
+  font-family: 'Cabinet Grotesk', sans-serif;
+  font-weight: 600;
+  font-size: 0.85rem;
+  cursor: pointer;
+  color: var(--text);
+  transition: all 0.2s;
+}
+.btn-secondary:hover {
+  border-color: #00D98B;
+  color: #00D98B;
+}
+.network-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  background: rgba(0,217,139,0.1);
+  padding: 0.2rem 0.8rem;
+  border-radius: 30px;
+  font-size: 0.7rem;
+  margin-bottom: 0.5rem;
+}
+.network-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #00D98B;
+  animation: pulseDot 1.5s ease infinite;
+}
+@keyframes pulseDot {
+  0%,100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(1.2); }
+}
+.delivery-estimate {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  font-size: 0.7rem;
+  color: var(--muted);
+  margin-top: 1rem;
+  padding-top: 0.8rem;
+  border-top: 1px solid rgba(255,255,255,0.08);
+}
+.confetti, .sparkle {
+  position: absolute;
+  pointer-events: none;
+  z-index: 10001;
+}
+.confetti { width: 10px; height: 10px; background: #00D98B; opacity: 0; }
+.sparkle { width: 4px; height: 4px; background: #FFD700; border-radius: 50%; animation: sparkleAnim 1.5s ease-out forwards; }
+@keyframes sparkleAnim {
+  0% { transform: scale(0); opacity: 1; }
+  100% { transform: scale(1.5); opacity: 0; }
+}
+footer { width: 100%; border-top: 1px solid var(--border); padding: 2.5rem 2.5rem; background: linear-gradient(180deg, transparent 0%, rgba(255,204,0,.02) 100%); transition: border-color 0.3s ease; }
+.footer-content { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 2rem; margin-bottom: 2rem; }
+.footer-section { flex: 1; min-width: 180px; }
+.footer-logo { font-family: 'Cabinet Grotesk', sans-serif; font-weight: 900; font-size: 1.2rem; letter-spacing: -1px; margin-bottom: 0.3rem; }
+.footer-tagline { font-size: 0.7rem; color: var(--muted); margin-top: 0.2rem; }
+.footer-section h4 { font-family: 'Cabinet Grotesk', sans-serif; font-size: 0.8rem; font-weight: 800; margin-bottom: 1rem; letter-spacing: 1px; text-transform: uppercase; color: var(--mtn); }
+.contact-item { display: flex; align-items: center; gap: 0.7rem; margin-bottom: 0.7rem; font-size: 0.82rem; color: var(--text); transition: color 0.2s ease; }
+.contact-item:hover { color: var(--mtn); }
+.contact-icon { font-size: 0.9rem; width: 24px; text-align: center; }
+.hours-item { display: flex; align-items: center; gap: 0.7rem; margin-bottom: 0.7rem; font-size: 0.82rem; color: var(--text); }
+.hours-badge { background: rgba(255,204,0,.12); padding: 0.2rem 0.6rem; border-radius: 20px; font-size: 0.68rem; font-weight: 600; color: var(--mtn); }
+.footer-links { display: flex; flex-direction: column; gap: 0.5rem; }
+.footer-links a { color: var(--muted); text-decoration: none; font-size: 0.82rem; transition: color 0.2s ease; }
+.footer-links a:hover { color: var(--mtn); }
+.footer-bottom { border-top: 1px solid var(--border); padding-top: 1.5rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; }
+.creator-credit { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 1rem; background: rgba(255,204,0,.05); border-radius: 40px; border: 1px solid rgba(255,204,0,.15); transition: all 0.3s ease; }
+.creator-credit:hover { background: rgba(255,204,0,.1); border-color: rgba(255,204,0,.3); transform: translateY(-2px); }
+.creator-icon { font-size: 0.85rem; filter: drop-shadow(0 0 4px rgba(255,204,0,.4)); }
+.creator-text { font-size: 0.7rem; font-weight: 500; }
+.creator-name { font-weight: 800; color: var(--mtn); background: linear-gradient(135deg, var(--mtn) 0%, #FFD633 100%); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.creator-heart { font-size: 0.65rem; animation: heartbeat 1.5s ease infinite; display: inline-block; }
+@keyframes heartbeat { 0%,100% { transform: scale(1); } 50% { transform: scale(1.15); } }
+.footer-copy { color: var(--muted); font-size: 0.7rem; }
+@media (max-width: 900px) { 
+  .footer-content { flex-direction: column; text-align: center; gap: 1.5rem; } 
+  .footer-section { text-align: center; } 
+  .contact-item, .hours-item { justify-content: center; } 
+  .footer-links { flex-direction: row; justify-content: center; flex-wrap: wrap; } 
+  .footer-bottom { flex-direction: column; text-align: center; }
+  .hero-wrap { grid-template-columns: 1fr; gap: 2rem; padding: 3rem 1.5rem; }
+  .hero-panel { display: none; }
+  .hero h1 { font-size: 2.8rem; }
+  .how-grid { grid-template-columns: 1fr; }
+  .nav-links a:not(.nav-cta) { display: none; }
+  .section { padding: 3rem 1.5rem; }
+  .tabs { width: 100%; justify-content: center; }
+  .tab-btn { padding: .5rem 1rem; font-size: .8rem; }
+  .bundles-grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; }
+  .notification-bell { top: 80px; right: 15px; }
+  .bell-icon { width: 40px; height: 40px; font-size: 1.2rem; }
+  .notification-panel { top: 140px; right: 15px; width: calc(100vw - 30px); }
+}
+@media (max-width: 540px) { 
+  nav { padding: .8rem 1.2rem; }
+  .hero-wrap { padding: 2rem 1rem; }
+  .hero h1 { font-size: 2rem; letter-spacing: -1px; }
+  .hero-desc { font-size: .9rem; }
+  .hero-stats { gap: 1.5rem; }
+  .stat-val { font-size: 1.4rem; }
+  .section { padding: 2rem 1rem; }
+  .sec-title { font-size: 1.6rem; }
+  .bundles-grid { grid-template-columns: 1fr; }
+  .toast { bottom: 1rem; right: 1rem; left: 1rem; max-width: none; }
+  .theme-toggle { padding: 0.2rem; }
+  .toggle-icon { width: 24px; height: 24px; font-size: 0.75rem; }
+}
+.toast { position: fixed; bottom: 2rem; right: 2rem; z-index: 9999; background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 1rem 1.3rem; display: flex; align-items: center; gap: .7rem; font-size: .88rem; max-width: 360px; transform: translateY(90px); opacity: 0; transition: all .35s; }
+.toast.show { transform: translateY(0); opacity: 1; }
+.toast.success { border-color: var(--green); }
+.toast.error { border-color: var(--red); }
+.toast.warning { border-color: var(--orange); }
+.toast-icon { width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: .8rem; flex-shrink: 0; }
+.toast.success .toast-icon { background: rgba(0,217,139,.15); color: var(--green); }
+.toast.error .toast-icon { background: rgba(255,68,85,.12); color: var(--red); }
+.toast.warning .toast-icon { background: rgba(255,149,0,.15); color: var(--orange); }
+.spin { width: 18px; height: 18px; border: 2.5px solid rgba(0,0,0,.25); border-top-color: rgba(0,0,0,.8); border-radius: 50%; animation: rot .5s linear infinite; }
+@keyframes rot { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
 
-app.get('/', (req, res) => {
-    const indexPath = path.join(__dirname, 'public', 'index.html');
+<!-- MAINTENANCE OVERLAY -->
+<div id="maintenanceOverlay" style="display: none;" class="maintenance-overlay">
+  <div class="maintenance-card">
+    <div class="maintenance-icon">🔧</div>
+    <div class="maintenance-title">Under Maintenance</div>
+    <div class="maintenance-message" id="maintenanceMessage">We're currently improving our systems to serve you better.</div>
+    <div class="maintenance-estimate" id="maintenanceEstimate">⏳ Estimated time: ~30 minutes</div>
+    <div class="social-links-maint">
+      <a href="https://wa.me/233534333528" target="_blank">📱 WhatsApp Support</a>
+      <a href="mailto:dataflow129@gmail.com">✉️ Email Us</a>
+      <a href="#" onclick="checkMaintenanceAgain()">🔄 Refresh Status</a>
+    </div>
+  </div>
+</div>
+
+<nav>
+  <div class="logo"><div class="logo-dot"></div> DataFlow</div>
+  <div class="nav-links"><a href="#bundles">Bundles</a><a href="#tracking">Track Order</a><a href="#how">How It Works</a></div>
+  <div class="theme-toggle" id="themeToggle"><div class="toggle-icon" id="lightIcon">☀️</div><div class="toggle-icon active" id="darkIcon">🌙</div></div>
+</nav>
+
+<div class="notification-bell" id="notificationBell"><div class="bell-icon">🔔<span class="notification-badge" id="notifBadge" style="display:none;">0</span></div></div>
+<div class="notification-panel" id="notificationPanel"><div class="notif-panel-header"><h3>📢 Announcements & Updates</h3><button class="close-panel" id="closePanelBtn">✕</button></div><div class="notif-list" id="notifList"><div class="empty-notif">Loading notifications...</div></div></div>
+
+<a href="https://chat.whatsapp.com/E69tvfvnsWEIYNJdxC79PR?mode=gi_t" class="whatsapp-float" target="_blank" rel="noopener noreferrer" aria-label="Join our WhatsApp community"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512" fill="currentColor"><path d="M380.9 97.1C339 55.1 283.2 32 223.9 32c-122.4 0-222 99.6-222 222 0 39.1 10.2 77.3 29.6 111L0 480l117.7-30.9c32.4 17.7 68.9 27 106.1 27h.1c122.3 0 224.1-99.6 224.1-222 0-59.3-25.2-115-67.1-157zm-157 341.6c-33.2 0-65.7-8.9-94-25.7l-6.7-4-69.8 18.3L72 359.2l-4.4-7c-18.5-29.4-28.2-63.3-28.2-98.2 0-101.7 82.8-184.5 184.6-184.5 49.3 0 95.6 19.2 130.4 54.1 34.8 34.9 56.2 81.2 56.1 130.5 0 101.8-84.9 184.6-186.6 184.6zm101.2-138.2c-5.5-2.8-32.8-16.2-37.9-18-5.1-1.9-8.8-2.8-12.5 2.8-3.7 5.6-14.3 18-17.6 21.8-3.2 3.7-6.5 4.2-12 1.4-32.6-16.3-54-29.1-75.5-66-5.7-9.8 5.7-9.1 16.3-30.3 1.8-3.7.9-6.9-.5-9.7-1.4-2.8-12.5-30.2-17.1-41.4-4.5-10.9-9.1-9.4-12.5-9.6-3.2-.2-6.9-.2-10.6-.2-3.7 0-9.7 1.4-14.8 6.9-5.1 5.6-19.4 19-19.4 46.3 0 27.3 19.9 53.7 22.6 57.4 2.8 3.7 39.1 59.7 94.8 83.8 35.2 15.2 49 16.5 66.6 13.9 10.7-1.6 32.8-13.4 37.4-26.4 4.6-13 4.6-24.1 3.2-26.4-1.3-2.5-5-3.9-10.5-6.6z"/></svg></a>
+
+<div class="hero-wrap">
+  <div>
+    <div class="hero-tag"><div class="blink"></div>Instant Data Delivery · Ghana</div>
+    <h1><span class="h1-mtn">MTN.</span> <span class="h1-tel">Telecel.</span> <span class="h1-at">AT.</span><br>One Store.<br>Best Prices.</h1>
+    <p class="hero-desc">Buy data bundles for any Ghanaian network at unbeatable prices. Pay securely with Paystack. Delivery in mins.</p>
+    <div class="hero-stats"><div><div class="stat-val">3</div><div class="stat-lbl">Networks covered</div></div><div><div class="stat-val">&lt;5mins</div><div class="stat-lbl">Avg delivery</div></div><div><div class="stat-val">24/7</div><div class="stat-lbl">Always live</div></div></div>
+  </div>
+  <div class="hero-panel">
+    <div class="panel-label">Live Status</div>
+    <div class="panel-title"><span class="mtn-c">MTN</span> · <span class="tel-c">Telecel</span> · <span class="at-c">AT</span></div>
+    <div class="signal-bars" id="heroBars"><div class="bar bar-1" style="background:var(--mtn)"></div><div class="bar bar-2" style="background:var(--mtn)"></div><div class="bar bar-3" style="background:var(--mtn)"></div><div class="bar bar-4" style="background:var(--mtn)"></div><div class="bar bar-5" style="background:var(--mtn)"></div></div>
+    <div class="panel-row"><span class="label">Last order</span><span class="badge-ok">✓ Delivered</span></div>
+    <div class="panel-row"><span class="label">Bundle</span><span>10GB</span></div>
+    <div class="panel-row"><span class="label">Networks</span><div style="display:flex;gap:.35rem"><span class="badge-network badge-mtn">MTN</span><span class="badge-network badge-tel">TEL</span><span class="badge-network badge-at">AT</span></div></div>
+    <div class="panel-row"><span class="label">Payment</span><span>Paystack · GHS</span></div>
+    <div class="panel-row"><span class="label">Delivery time</span><span style="color:var(--green);font-weight:700">~15 seconds</span></div>
+  </div>
+</div>
+
+<div class="tracking-section" id="tracking"><div class="tracking-card"><div class="tracking-header"><h2>🔍 Track Your Order</h2><p>Enter your phone number or order ID to check delivery status</p></div><div class="tracking-input-group"><input type="text" class="tracking-input" id="trackingInput" placeholder="📱 Phone number (e.g., 0241234567) or 🔖 Order ID (e.g., DF-1234567890)"><button class="tracking-btn" id="trackBtn">Track Order →</button></div><div class="order-result" id="orderResult"></div></div></div>
+
+<hr class="divider"><div class="section" id="bundles"><div class="sec-head"><h2 class="sec-title">Data Bundles</h2><p class="sec-sub">Select a network below to browse available packages</p></div><div class="tabs"><button class="tab-btn active-mtn" id="tab-mtn" onclick="switchNetwork('mtn')"><span class="pip" style="background:var(--mtn)"></span> MTN</button><button class="tab-btn" id="tab-tel" onclick="switchNetwork('tel')"><span class="pip" style="background:var(--tel)"></span> Telecel</button><button class="tab-btn" id="tab-at" onclick="switchNetwork('at')"><span class="pip" style="background:var(--at)"></span> AT</button></div><div class="bundles-grid" id="bundlesGrid"></div></div><hr class="divider"><div class="section" id="how"><div class="sec-head"><h2 class="sec-title">How It Works</h2><p class="sec-sub">Three steps to stay connected</p></div><div class="how-grid"><div class="how-card"><div class="how-icon">📡</div><div class="how-num">01</div><h3>Choose Your Network</h3><p>Pick MTN, Telecel, or AT and browse bundles tailored for each network — from 1GB to 50GB.</p></div><div class="how-card"><div class="how-icon">🔒</div><div class="how-num">02</div><h3>Pay Securely</h3><p>Complete payment via Paystack using card, bank transfer, or MoMo. 100% secure and instant.</p></div><div class="how-card"><div class="how-icon">⚡</div><div class="how-num">03</div><h3>Instant Delivery</h3><p>Your data is credited to your number within seconds. No waiting, no stress, no manual steps.</p></div></div></div>
+
+<footer><div class="footer-content"><div class="footer-section"><div class="footer-logo">DataFlow</div><div class="footer-tagline">Ghana's fastest data store</div></div><div class="footer-section"><h4>📞 Contact Us</h4><div class="contact-item"><span class="contact-icon">📱</span><span>053 947 7194</span></div><div class="contact-item"><span class="contact-icon">📱</span><span>053 433 3528</span></div><div class="contact-item"><span class="contact-icon">✉️</span><span>dataflow129@gmail.com</span></div></div><div class="footer-section"><h4>⏰ Working Hours</h4><div class="hours-item"><span class="hours-badge">Mon - Sun</span><span>6:00 AM - 9:00 PM</span></div><div class="hours-item"><span class="hours-badge">Support</span><span>Always online</span></div></div><div class="footer-section"><h4>🔗 Quick Links</h4><div class="footer-links"><a href="#bundles">Browse Bundles</a><a href="#tracking">Track Order</a></div></div></div><div class="footer-bottom"><div class="footer-copy">Secured by Paystack · All networks · Ghana</div><div class="creator-credit"><span class="creator-icon">✨</span><span class="creator-text">Created & owned by</span><span class="creator-name">Martin Osei Jnr.</span><span class="creator-heart">❤️</span></div></div></footer>
+
+<!-- PURCHASE MODAL -->
+<div class="overlay" id="overlay">
+  <div class="modal" id="modal">
+    <div class="modal-glow" id="modalGlow"></div>
+    <div class="modal-content">
+      <div class="modal-head">
+        <div>
+          <div class="modal-title">Complete Purchase</div>
+          <div class="modal-sub" id="modalSub">Fill in your details to continue</div>
+        </div>
+        <button class="close-btn" id="closeBtn">✕</button>
+      </div>
+      <div class="order-chip">
+        <div class="chip-left">
+          <div class="lbl">Bundle</div>
+          <div class="val" id="chipBundle">—</div>
+          <div class="sub" id="chipType">90 Days</div>
+        </div>
+        <div class="chip-right">
+          <div class="lbl">Data price</div>
+          <div class="price" id="chipPrice">—</div>
+        </div>
+      </div>
+      <div class="fee-breakdown" id="feeBreakdown">
+        <div class="fee-row"><span class="fee-label">Data price</span><span class="fee-value" id="dataPriceDisplay">GH₵ 0.00</span></div>
+        <div class="fee-row"><span class="fee-label">+ Paystack fee (1.95%)</span><span class="fee-value" id="feeAmountDisplay">GH₵ 0.00</span></div>
+        <div class="fee-row total"><span class="fee-label">Grand total</span><span class="fee-value" id="grandTotalDisplay">GH₵ 0.00</span></div>
+      </div>
+      <div class="field"><label>Recipient Number</label><input type="tel" id="fPhone" placeholder="e.g. 0241234567" maxlength="10"></div>
+      <div class="field"><label>Email (for receipt)</label><input type="email" id="fEmail" placeholder="you@example.com"></div>
+      <div class="field"><label>Full Name</label><input type="text" id="fName" placeholder="Your full name"></div>
+      <div class="warning-notice">
+        <div class="warning-icon">!</div>
+        <p class="warning-text">Please note that data sent to a wrong number, Broadband SIM, or Turbonet SIM <strong>CANNOT BE REFUNDED.</strong> Double-check the recipient number before paying.</p>
+      </div>
+      <button class="pay-btn" id="payBtn">Pay with Paystack</button>
+      <div class="secure-note">🔒 Secured by Paystack · SSL Encrypted</div>
+    </div>
+  </div>
+</div>
+
+<!-- ENHANCED SUCCESS MODAL -->
+<div id="successModal" class="success-overlay">
+  <div class="success-modal">
+    <div class="success-icon-wrapper">
+      <div class="success-icon-circle">
+        <div class="success-icon-check">
+          <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <polyline points="20 6 9 17 4 12" stroke="white" fill="none"/>
+          </svg>
+        </div>
+      </div>
+    </div>
+    <div class="success-title">Payment Successful!</div>
+    <div class="network-indicator"><span class="network-dot"></span><span id="successNetwork">MTN</span> · Instant Delivery</div>
+    <div class="success-bundle" id="successBundle">15GB</div>
+    <div class="success-message" id="successMessage">Your data bundle has been ordered successfully!<br>Check your phone within 30 seconds.</div>
+    <div class="success-ref-card"><span class="ref-label">Order ID</span><span class="ref-value" id="successRef">DF-XXXXXXXXXXXX</span><button class="copy-ref-btn" id="copyRefBtn">📋 Copy</button></div>
+    <div class="success-actions"><button class="btn-primary" id="closeSuccessBtn">Continue Shopping</button><button class="btn-secondary" id="trackOrderSuccessBtn">Track Order →</button></div>
+    <div class="delivery-estimate"><span>⚡</span> Estimated delivery: ~15 seconds <span>🔒</span></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"><div class="toast-icon" id="toastIcon"></div><span id="toastMsg"></span></div>
+
+<script>
+// ============================================================
+// DATEFLOW GH - SECURE FRONTEND (Webhook-Only Delivery)
+// ============================================================
+
+(function() {
+    'use strict';
+
+    // ─────────────────────────────────────────────
+    // CONFIG - Injected by server
+    // ─────────────────────────────────────────────
+    
+    var config = window.__DF_CONFIG || {};
+    var PAYSTACK_KEY = config.paystackKey || 'pk_live_ca0cb6cd18a148e6f9a915b4f8bd18be85d335b0';
+    var BACKEND_URL = config.backendUrl || window.location.origin;
+    
+    // API endpoints (frontend can only READ - no delivery calls!)
+    var API_BUNDLES = BACKEND_URL + '/api/bundles';
+    var API_ORDER_STATUS = BACKEND_URL + '/api/order-status';
+
+    // ─────────────────────────────────────────────
+    // FIREBASE - Minimal config (public)
+    // ─────────────────────────────────────────────
+    
+    var firebaseConfig = {
+        apiKey: 'AIzaSyA4alwKo0W8ezsudsTTzU3Ra-hzOr4ud9I',
+        authDomain: 'stafford-2efd9.firebaseapp.com',
+        databaseURL: 'https://stafford-2efd9-default-rtdb.firebaseio.com',
+        projectId: 'stafford-2efd9',
+        storageBucket: 'stafford-2efd9.firebasestorage.app',
+        appId: '1:121550271251:web:cffe005a2c0313db7960e6'
+    };
+
+    var db = null;
+    var auth = null;
+    var currentUserId = null;
 
     try {
-        let html = fs.readFileSync(indexPath, 'utf8');
-
-        // ONLY inject the public Paystack key - NO DELIVER_SECRET
-        const injectScript = `
-        <script>
-          // Securely injected from server - public only
-          window.__DF_CONFIG = {
-            paystackKey: "${process.env.PAYSTACK_PUBLIC_KEY || 'pk_live_ca0cb6cd18a148e6f9a915b4f8bd18be85d335b0'}",
-            backendUrl: "${process.env.BACKEND_URL || ''}"
-          };
-          console.log('🔒 Secure config loaded');
-        </script>
-        `;
-
-        html = html.replace('</head>', injectScript + '</head>');
-        res.send(html);
-    } catch (err) {
-        console.error('Error serving index:', err);
-        res.status(500).send('Error loading page');
+        if (!firebase.apps.length) {
+            firebase.initializeApp(firebaseConfig);
+        }
+        auth = firebase.auth();
+        db = firebase.database();
+        auth.signInAnonymously().catch(function(e) { console.warn(e); });
+        auth.onAuthStateChanged(function(user) {
+            if (user) {
+                currentUserId = user.uid;
+            } else {
+                auth.signInAnonymously().catch(function(e) { console.warn(e); });
+            }
+        });
+    } catch (e) {
+        console.warn('Firebase init error:', e.message);
     }
+
+    // ─────────────────────────────────────────────
+    // THEME
+    // ─────────────────────────────────────────────
+    
+    function initTheme() {
+        var theme = localStorage.getItem('dataflow-theme');
+        var isLight = theme === null || theme === 'light';
+        document.documentElement.setAttribute('data-theme', isLight ? 'light' : 'dark');
+        var lightIcon = document.getElementById('lightIcon');
+        var darkIcon = document.getElementById('darkIcon');
+        if (lightIcon) {
+            lightIcon.classList.toggle('active', isLight);
+        }
+        if (darkIcon) {
+            darkIcon.classList.toggle('active', !isLight);
+        }
+    }
+
+    function setTheme(theme) {
+        localStorage.setItem('dataflow-theme', theme);
+        initTheme();
+    }
+
+    document.getElementById('lightIcon').addEventListener('click', function() { setTheme('light'); });
+    document.getElementById('darkIcon').addEventListener('click', function() { setTheme('dark'); });
+
+    // ─────────────────────────────────────────────
+    // MAINTENANCE
+    // ─────────────────────────────────────────────
+    
+    var isMaintenanceActive = false;
+
+    async function checkMaintenanceStatus() {
+        if (!db) {
+            document.getElementById('maintenanceOverlay').style.display = 'none';
+            return false;
+        }
+        try {
+            var snapshot = await db.ref('system/maintenance').once('value');
+            var data = snapshot.val();
+            if (data && data.active === true) {
+                isMaintenanceActive = true;
+                document.getElementById('maintenanceMessage').innerText = data.message || 'We are currently performing system upgrades.';
+                document.getElementById('maintenanceEstimate').innerHTML = '⏳ Estimated time: ' + (data.estimatedTime || '~30 minutes');
+                document.getElementById('maintenanceOverlay').style.display = 'flex';
+                return true;
+            } else {
+                isMaintenanceActive = false;
+                document.getElementById('maintenanceOverlay').style.display = 'none';
+                return false;
+            }
+        } catch (err) {
+            console.warn('Maintenance check:', err);
+            document.getElementById('maintenanceOverlay').style.display = 'none';
+            return false;
+        }
+    }
+
+    window.checkMaintenanceAgain = function() {
+        checkMaintenanceStatus().then(function(active) {
+            if (!active) {
+                showToast('✅ Store is back online! You can now place orders.', 'success');
+            } else {
+                showToast('⚠️ Store is under maintenance. Please check back soon.', 'warning');
+            }
+        });
+    };
+
+    // ─────────────────────────────────────────────
+    // HELPER FUNCTIONS
+    // ─────────────────────────────────────────────
+    
+    var FEE_PERCENT = 0.0195;
+    
+    var NETWORK_META = {
+        mtn: { label: 'MTN', accent: '#FFCC00', textColor: '#06060A' },
+        tel: { label: 'Telecel', accent: '#E8212A', textColor: '#fff' },
+        at: { label: 'AT', accent: '#007DC5', textColor: '#fff' }
+    };
+    
+    var NETWORK_MAP = {
+        mtn: 'mtn',
+        tel: 'telecel',
+        at: 'airteltigo'
+    };
+
+    var EXACT_MTN_PRICES = {
+        "1024": 5.00, "2048": 9.40, "3072": 13.40, "4096": 17.70,
+        "5120": 22.50, "6144": 26.30, "10240": 43.20, "15360": 63.20,
+        "20480": 82.70, "25600": 105.20, "30720": 126.70, "40960": 171.70,
+        "51200": 202.70, "102400": 437.70
+    };
+
+    function sellingPrice(costPrice, volumeInMB, networkType) {
+        if (networkType === 'mtn') {
+            var exactPrice = EXACT_MTN_PRICES[volumeInMB.toString()];
+            if (exactPrice !== undefined) {
+                return exactPrice;
+            }
+        }
+        return costPrice;
+    }
+
+    function calculateTotalWithFee(amount) {
+        var total = amount / (1 - FEE_PERCENT);
+        return {
+            total: Math.round(total * 100) / 100,
+            fee: Math.round((total - amount) * 100) / 100
+        };
+    }
+
+    function displaySize(mb) {
+        if (mb >= 1024) {
+            var gb = mb / 1024;
+            return Number.isInteger(gb) ? gb + 'GB' : gb.toFixed(1) + 'GB';
+        }
+        return mb + 'MB';
+    }
+
+    function displaySizeLabel(mb) {
+        if (mb === 1000) return '1GB';
+        if (mb >= 1024) {
+            var gb = mb / 1024;
+            var rounded = Math.round(gb);
+            var overrides = { 24: 25, 29: 30, 39: 40, 49: 50, 98: 100 };
+            return (overrides[rounded] || rounded) + 'GB';
+        }
+        return mb + 'MB';
+    }
+
+    function ppgb(mb, price) {
+        var gb = mb / 1024;
+        return gb > 0 ? 'GH₵ ' + (price / gb).toFixed(2) + ' / GB' : '';
+    }
+
+    function validateNetworkCompatibility(phone, networkType) {
+        var prefix = phone.substring(0, 3);
+        var mtnPrefixes = ['024', '054', '055', '059', '053'];
+        var telPrefixes = ['020', '050', '026'];
+        var atPrefixes = ['027', '057'];
+        
+        if (networkType === 'mtn' && !mtnPrefixes.includes(prefix)) {
+            return '❌ ' + phone + ' is not an MTN number. MTN numbers start with 024, 054, 055,053, or 059.';
+        }
+        if (networkType === 'telecel' && !telPrefixes.includes(prefix)) {
+            return '❌ ' + phone + ' is not a Telecel number. Telecel numbers start with 020, 050, or 026.';
+        }
+        if (networkType === 'airteltigo' && !atPrefixes.includes(prefix)) {
+            return '❌ ' + phone + ' is not an AT number. AT numbers start with 027 or 057.';
+        }
+        return null;
+    }
+
+    // ─────────────────────────────────────────────
+    // BUNDLES
+    // ─────────────────────────────────────────────
+    
+    var currentNetwork = 'mtn';
+    var selectedBundle = null;
+    var BUNDLES_CACHE = {};
+
+    async function fetchBundles(networkType) {
+        if (BUNDLES_CACHE[networkType]) return BUNDLES_CACHE[networkType];
+        
+        var grid = document.getElementById('bundlesGrid');
+        grid.innerHTML = '<div class="coming-soon-panel"><div style="font-size:1.5rem">⏳</div><div style="font-size:0.95rem">Loading bundles…</div></div>';
+        
+        try {
+            var response = await fetch(API_BUNDLES + '?network=' + networkType);
+            var data = await response.json();
+            
+            if (data.status !== 'success' || !data.data || !data.data.length) {
+                BUNDLES_CACHE[networkType] = [];
+                return [];
+            }
+            
+            var bundles = data.data.map(function(b, i) {
+                var volumeMB = Number(b.volumeInMB);
+                var costPriceFromBackend = parseFloat(b.price);
+                var finalPrice = sellingPrice(costPriceFromBackend, volumeMB, networkType);
+                return {
+                    id: networkType + '_' + i,
+                    size: displaySize(volumeMB),
+                    volumeInMB: volumeMB,
+                    networkType: networkType,
+                    costPrice: costPriceFromBackend,
+                    profit: finalPrice - costPriceFromBackend,
+                    price: finalPrice,
+                    hot: [1024, 5120, 10240].includes(volumeMB)
+                };
+            });
+            
+            BUNDLES_CACHE[networkType] = bundles;
+            return bundles;
+        } catch (err) {
+            console.error('Failed to load bundles:', err);
+            BUNDLES_CACHE[networkType] = [];
+            return [];
+        }
+    }
+
+    async function renderBundles(tabKey) {
+        var meta = NETWORK_META[tabKey];
+        var networkType = NETWORK_MAP[tabKey];
+        var grid = document.getElementById('bundlesGrid');
+        document.documentElement.style.setProperty('--active', meta.accent);
+        
+        if (tabKey === 'tel' || tabKey === 'at') {
+            grid.innerHTML = '<div class="coming-soon-panel"><div style="font-size:1.5rem">🚀</div><div style="font-size:0.95rem">Coming Soon</div><div style="color:var(--muted);font-size:0.8rem;margin-top:0.5rem">' + meta.label + ' bundles will be available shortly.</div></div>';
+            return;
+        }
+        
+        var list = await fetchBundles(networkType);
+        if (!list.length) {
+            grid.innerHTML = '<div class="coming-soon-panel"><div style="font-size:1.5rem">🚀</div><div style="font-size:0.95rem">Coming Soon</div><div style="color:var(--muted);font-size:0.8rem;margin-top:0.5rem">' + meta.label + ' bundles will be available shortly.</div></div>';
+            return;
+        }
+        
+        grid.innerHTML = list.map(function(b, i) {
+            return '<div class="bundle-panel ' + (b.hot ? 'hot' : '') + '" style="animation-delay:' + (i * 0.05) + 's">' +
+                (b.hot ? '<div class="hot-label" style="background:' + meta.accent + ';color:' + meta.textColor + '">Popular</div>' : '') +
+                '<div class="bp-network" style="color:' + meta.accent + '">' + meta.label + '</div>' +
+                '<div class="bp-size" style="color:' + meta.accent + '">' + displaySizeLabel(b.volumeInMB) + '</div>' +
+                '<div class="bp-validity">Valid 90 Days</div>' +
+                '<div class="bp-price">GH₵ ' + b.price.toFixed(2) + '</div>' +
+                '<div class="bp-ppgb">' + ppgb(b.volumeInMB, b.price) + '</div>' +
+                '<button class="bp-btn" data-id="' + b.id + '" data-network="' + tabKey + '" style="--active:' + meta.accent + '">Buy Now →</button>' +
+                '</div>';
+        }).join('');
+        
+        grid.querySelectorAll('.bp-btn').forEach(function(btn) {
+            btn.addEventListener('click', function(e) {
+                openModal(e.currentTarget.dataset.id, e.currentTarget.dataset.network);
+            });
+        });
+    }
+
+    window.switchNetwork = function(tabKey) {
+        currentNetwork = tabKey;
+        ['mtn', 'tel', 'at'].forEach(function(n) {
+            var tab = document.getElementById('tab-' + n);
+            if (tab) {
+                tab.className = 'tab-btn';
+                if (n === tabKey) tab.classList.add('active-' + n);
+            }
+        });
+        document.documentElement.style.setProperty('--active', NETWORK_META[tabKey].accent);
+        renderBundles(tabKey);
+    };
+
+    // ─────────────────────────────────────────────
+    // MODAL
+    // ─────────────────────────────────────────────
+    
+    function openModal(id, tabKey) {
+        if (isMaintenanceActive) {
+            showToast('🔧 Store is under maintenance. Please try again later.', 'warning');
+            return;
+        }
+        
+        var meta = NETWORK_META[tabKey];
+        var networkType = NETWORK_MAP[tabKey];
+        var list = BUNDLES_CACHE[networkType] || [];
+        
+        if (!list.length) {
+            showToast(meta.label + ' bundles coming soon!', 'error');
+            return;
+        }
+        
+        selectedBundle = list.find(function(b) { return b.id === id; });
+        if (!selectedBundle) return;
+        selectedBundle.tabKey = tabKey;
+        
+        if (!selectedBundle.volumeInMB) return;
+        
+        var totals = calculateTotalWithFee(selectedBundle.price);
+        selectedBundle.grandTotal = totals.total;
+        
+        document.getElementById('chipBundle').textContent = displaySizeLabel(selectedBundle.volumeInMB);
+        document.getElementById('chipBundle').style.color = meta.accent;
+        document.getElementById('chipType').textContent = meta.label + ' · 90 Days';
+        document.getElementById('chipPrice').textContent = 'GH₵ ' + selectedBundle.price.toFixed(2);
+        document.getElementById('dataPriceDisplay').textContent = 'GH₵ ' + selectedBundle.price.toFixed(2);
+        document.getElementById('feeAmountDisplay').textContent = 'GH₵ ' + totals.fee.toFixed(2);
+        document.getElementById('grandTotalDisplay').textContent = 'GH₵ ' + totals.total.toFixed(2);
+        document.getElementById('modalSub').textContent = 'Buying ' + meta.label + ' bundle';
+        document.getElementById('modalGlow').style.background = 'radial-gradient(circle, ' + meta.accent + '15 0%, transparent 70%)';
+        
+        var btn = document.getElementById('payBtn');
+        btn.style.background = meta.accent;
+        btn.style.color = meta.textColor;
+        
+        document.getElementById('overlay').classList.add('open');
+    }
+
+    function closeModal() {
+        document.getElementById('overlay').classList.remove('open');
+        ['fPhone', 'fEmail', 'fName'].forEach(function(id) {
+            var el = document.getElementById(id);
+            if (el) el.value = '';
+        });
+        var btn = document.getElementById('payBtn');
+        btn.disabled = false;
+        btn.innerHTML = 'Pay with Paystack';
+    }
+
+    document.getElementById('overlay').addEventListener('click', function(e) {
+        if (e.target.id === 'overlay') closeModal();
+    });
+    document.getElementById('closeBtn').addEventListener('click', closeModal);
+    document.getElementById('payBtn').addEventListener('click', pay);
+
+    // ─────────────────────────────────────────────
+    // PAYMENT - SECURE VERSION (No /deliver call!)
+    // ─────────────────────────────────────────────
+    
+    function pay() {
+        if (isMaintenanceActive) {
+            showToast('🔧 Store is under maintenance.', 'warning');
+            closeModal();
+            return;
+        }
+        
+        var phone = document.getElementById('fPhone').value.trim();
+        var email = document.getElementById('fEmail').value.trim();
+        var name = document.getElementById('fName').value.trim();
+        
+        if (phone.length < 10) return showToast('Enter a valid 10-digit number', 'error');
+        if (!email.includes('@')) return showToast('Enter a valid email address', 'error');
+        if (!name) return showToast('Enter your full name', 'error');
+        
+        var networkType = selectedBundle.networkType;
+        var networkLabel = NETWORK_META[selectedBundle.tabKey].label;
+        
+        var validationError = validateNetworkCompatibility(phone, networkType);
+        if (validationError) return showToast(validationError, 'error');
+        
+        var ref = 'DF' + Date.now() + Math.random().toString(36).substring(2, 6).toUpperCase();
+        
+        PaystackPop.setup({
+            key: PAYSTACK_KEY,
+            email: email,
+            amount: Math.round(selectedBundle.grandTotal * 100),
+            currency: 'GHS',
+            ref: ref,
+            metadata: {
+                phone: phone,
+                volumeInMB: selectedBundle.volumeInMB,
+                networkType: networkType,
+                orderId: ref,
+                custom_fields: [
+                    { display_name: 'Name', variable_name: 'name', value: name },
+                    { display_name: 'Phone', variable_name: 'phone', value: phone },
+                    { display_name: 'Bundle', variable_name: 'bundle', value: selectedBundle.size },
+                    { display_name: 'Network', variable_name: 'network', value: networkLabel }
+                ]
+            },
+            callback: function(r) { 
+                processOrder(r.reference, phone, email, name, selectedBundle); 
+            },
+            onClose: function() { showToast('Payment cancelled', 'error'); }
+        }).openIframe();
+    }
+
+    // SECURE: This function ONLY saves to Firebase and shows UI
+    // The actual delivery is triggered by the Paystack webhook
+    async function processOrder(ref, phone, email, name, bundle) {
+        var btn = document.getElementById('payBtn');
+        btn.disabled = true;
+        btn.innerHTML = '<div class="spin"></div><span>Processing payment…</span>';
+        
+        var netLabel = NETWORK_META[bundle.tabKey].label;
+        var orderId = 'DF-' + Date.now();
+        var networkType = bundle.networkType;
+        var volumeInMB = bundle.volumeInMB;
+        
+        var orderData = {
+            orderId: orderId,
+            ref: ref,
+            phone: phone,
+            email: email,
+            name: name,
+            bundle: bundle.size,
+            network: bundle.tabKey,
+            networkType: networkType,
+            volumeInMB: volumeInMB,
+            networkLabel: netLabel,
+            amount: bundle.price,
+            grandTotalPaid: bundle.grandTotal,
+            status: 'pending',
+            deliveryStatus: 'pending',
+            timestamp: new Date().toISOString(),
+            userId: currentUserId || 'anonymous'
+        };
+        
+        if (db) {
+            try {
+                await db.ref('orders/' + orderId).set(orderData);
+            } catch (e) {
+                console.warn('Firebase save:', e);
+            }
+        }
+        
+        closeModal();
+        openSuccessModal(displaySizeLabel(volumeInMB), netLabel, orderId);
+        showToast('✅ Payment successful! Your data will be delivered shortly.', 'success');
+        
+        btn.disabled = false;
+        btn.innerHTML = 'Pay with Paystack';
+    }
+
+    // ─────────────────────────────────────────────
+    // SUCCESS MODAL
+    // ─────────────────────────────────────────────
+    
+    function createConfetti() {
+        var colors = ['#00D98B', '#FFD700', '#FF6B6B', '#4D9EFF', '#FF9500'];
+        for (var i = 0; i < 80; i++) {
+            (function(index) {
+                setTimeout(function() {
+                    var confetti = document.createElement('div');
+                    confetti.className = 'confetti';
+                    confetti.style.left = Math.random() * window.innerWidth + 'px';
+                    confetti.style.top = '-10px';
+                    confetti.style.width = (Math.random() * 8 + 4) + 'px';
+                    confetti.style.height = (Math.random() * 8 + 4) + 'px';
+                    confetti.style.background = colors[Math.floor(Math.random() * colors.length)];
+                    confetti.style.borderRadius = Math.random() > 0.5 ? '50%' : '0%';
+                    confetti.style.opacity = '1';
+                    confetti.style.position = 'fixed';
+                    confetti.style.zIndex = '10001';
+                    document.body.appendChild(confetti);
+                    
+                    var duration = Math.random() * 1500 + 1000;
+                    confetti.animate([
+                        { transform: 'translateY(0) rotate(0deg)', opacity: 1 },
+                        { transform: 'translateY(' + window.innerHeight + 'px) rotate(' + (Math.random() * 720) + 'deg)', opacity: 0 }
+                    ], {
+                        duration: duration,
+                        easing: 'cubic-bezier(0.2, 0.9, 0.4, 1)',
+                        fill: 'forwards'
+                    }).onfinish = function() {
+                        confetti.remove();
+                    };
+                }, index * 30);
+            })(i);
+        }
+    }
+
+    function copyReference() {
+        var refText = document.getElementById('successRef').innerText;
+        navigator.clipboard.writeText(refText).then(function() {
+            var copyBtn = document.getElementById('copyRefBtn');
+            var originalText = copyBtn.innerHTML;
+            copyBtn.innerHTML = '✓ Copied!';
+            setTimeout(function() { copyBtn.innerHTML = originalText; }, 2000);
+            showToast('Order ID copied to clipboard!', 'success');
+        });
+    }
+
+    function trackOrderFromSuccess() {
+        closeSuccessModal();
+        var orderId = document.getElementById('successRef').innerText;
+        var trackingInput = document.getElementById('trackingInput');
+        if (trackingInput) {
+            trackingInput.value = orderId;
+            trackOrder();
+        }
+        document.getElementById('tracking').scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function openSuccessModal(bundleSize, network, orderId) {
+        var modal = document.getElementById('successModal');
+        document.getElementById('successBundle').innerText = bundleSize || '15GB';
+        document.getElementById('successNetwork').innerHTML = (network || 'MTN') + ' · Instant Delivery';
+        document.getElementById('successRef').innerText = orderId || 'DF-' + Date.now().toString().slice(-10);
+        
+        var msgEl = document.getElementById('successMessage');
+        msgEl.innerHTML = 'Your ' + network + ' data bundle has been ordered successfully!<br>The data will be delivered to your phone within seconds.';
+        
+        modal.classList.add('open');
+        createConfetti();
+        if (navigator.vibrate) navigator.vibrate(200);
+    }
+
+    function closeSuccessModal() {
+        document.getElementById('successModal').classList.remove('open');
+    }
+
+    document.getElementById('copyRefBtn').addEventListener('click', copyReference);
+    document.getElementById('closeSuccessBtn').addEventListener('click', closeSuccessModal);
+    document.getElementById('trackOrderSuccessBtn').addEventListener('click', trackOrderFromSuccess);
+    document.getElementById('successModal').addEventListener('click', function(e) {
+        if (e.target === document.getElementById('successModal')) closeSuccessModal();
+    });
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape' && document.getElementById('successModal').classList.contains('open')) {
+            closeSuccessModal();
+        }
+    });
+
+    // ─────────────────────────────────────────────
+    // TRACK ORDER - Uses backend API (secure)
+    // ─────────────────────────────────────────────
+    
+    async function trackOrder() {
+        var query = document.getElementById('trackingInput').value.trim();
+        var resultDiv = document.getElementById('orderResult');
+        
+        if (!query) {
+            resultDiv.innerHTML = '<div class="no-order">🔍 Enter a phone number or order ID to track</div>';
+            resultDiv.style.display = 'block';
+            return;
+        }
+        
+        resultDiv.innerHTML = '<div class="no-order">⏳ Searching for your order...</div>';
+        resultDiv.style.display = 'block';
+        
+        try {
+            var response = await fetch(API_ORDER_STATUS + '/' + encodeURIComponent(query));
+            var data = await response.json();
+            
+            if (data.status === 'success') {
+                var order = data.order || data.data;
+                if (order) {
+                    var isCompleted = order.status === 'completed';
+                    var isFailed = order.status === 'failed';
+                    
+                    var statusText, statusClass;
+                    if (isCompleted) {
+                        statusText = 'Delivered ✓';
+                        statusClass = 'completed';
+                    } else if (isFailed) {
+                        statusText = 'Failed ⚠️';
+                        statusClass = 'failed';
+                    } else {
+                        statusText = 'Processing ⏳';
+                        statusClass = 'pending';
+                    }
+                    
+                    resultDiv.innerHTML = '<div class="order-card">' +
+                        '<div class="order-status-header">' +
+                        '<div class="status-icon ' + (isCompleted ? 'completed' : isFailed ? 'failed' : 'pending') + '">' +
+                        (isCompleted ? '✓' : isFailed ? '⚠️' : '⏳') +
+                        '</div>' +
+                        '<div class="status-info">' +
+                        '<h3>Order #' + (order.orderId || order.id || query) + '</h3>' +
+                        '<span class="status-badge ' + statusClass + '">' + statusText + '</span>' +
+                        '</div>' +
+                        '</div>' +
+                        '<div class="order-details-grid">' +
+                        '<div class="detail-item"><span class="detail-label">Customer Name</span><span class="detail-value">' + (order.name || '—') + '</span></div>' +
+                        '<div class="detail-item"><span class="detail-label">Phone Number</span><span class="detail-value">' + (order.phone || '—') + '</span></div>' +
+                        '<div class="detail-item"><span class="detail-label">Data Bundle</span><span class="detail-value">' + (order.bundle || '—') + '</span></div>' +
+                        '<div class="detail-item"><span class="detail-label">Network</span><span class="detail-value">' + (order.networkLabel || order.network || '—') + '</span></div>' +
+                        '<div class="detail-item"><span class="detail-label">Amount Paid</span><span class="detail-value">GH₵ ' + ((order.amount || 0).toFixed(2)) + '</span></div>' +
+                        '<div class="detail-item"><span class="detail-label">Order Date</span><span class="detail-value">' + new Date(order.timestamp).toLocaleString() + '</span></div>' +
+                        '</div>' +
+                        '</div>';
+                    return;
+                }
+            }
+            
+            resultDiv.innerHTML = '<div class="no-order">❌ No order found. Please check your phone number or order ID.<br><small>Example: 024XXXXXXX or DF-XXXXXXXXXXXX</small></div>';
+            
+        } catch (err) {
+            console.error('Tracking error:', err);
+            resultDiv.innerHTML = '<div class="no-order">⚠️ Error connecting to server. Please try again.</div>';
+        }
+    }
+
+    document.getElementById('trackBtn').addEventListener('click', trackOrder);
+    document.getElementById('trackingInput').addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') trackOrder();
+    });
+
+    // ─────────────────────────────────────────────
+    // TOAST
+    // ─────────────────────────────────────────────
+    
+    function showToast(msg, type) {
+        type = type || 'success';
+        var el = document.getElementById('toast');
+        var icon = document.getElementById('toastIcon');
+        document.getElementById('toastMsg').textContent = msg;
+        icon.textContent = type === 'success' ? '✓' : type === 'warning' ? '⚠️' : '!';
+        el.className = 'toast show ' + type;
+        setTimeout(function() {
+            el.className = 'toast';
+        }, 5000);
+    }
+
+    // ─────────────────────────────────────────────
+    // NOTIFICATIONS
+    // ─────────────────────────────────────────────
+    
+    var notifications = [];
+    var unreadCount = 0;
+
+    async function loadNotifications() {
+        if (!db) return;
+        try {
+            var snapshot = await db.ref('admin_notifications').once('value');
+            var data = snapshot.val();
+            if (!data) {
+                document.getElementById('notifList').innerHTML = '<div class="empty-notif">✨ No announcements yet</div>';
+                return;
+            }
+            notifications = Object.values(data).sort(function(a, b) {
+                return new Date(b.timestamp) - new Date(a.timestamp);
+            });
+            var readIds = JSON.parse(localStorage.getItem('read_notifications') || '[]');
+            unreadCount = notifications.filter(function(n) {
+                return !readIds.includes(n.id);
+            }).length;
+            updateBadge();
+            renderNotificationList();
+        } catch (err) {
+            console.warn('Notifications:', err);
+        }
+    }
+
+    function renderNotificationList() {
+        var listDiv = document.getElementById('notifList');
+        var readIds = JSON.parse(localStorage.getItem('read_notifications') || '[]');
+        if (!notifications.length) {
+            listDiv.innerHTML = '<div class="empty-notif">📭 No notifications yet</div>';
+            return;
+        }
+        listDiv.innerHTML = notifications.map(function(notif) {
+            return '<div class="notif-item ' + (!readIds.includes(notif.id) ? 'unread' : '') + '" data-id="' + notif.id + '" onclick="markAsRead(\'' + notif.id + '\')">' +
+                '<span class="notif-type-badge ' + notif.type + '">' + notif.type.toUpperCase() + '</span>' +
+                '<div class="notif-title">' + escapeHtml(notif.title) + '</div>' +
+                '<div class="notif-message">' + escapeHtml(notif.message) + '</div>' +
+                '<div class="notif-time">' + new Date(notif.timestamp).toLocaleString() + '</div>' +
+                '</div>';
+        }).join('');
+    }
+
+    window.markAsRead = function(notifId) {
+        var readIds = JSON.parse(localStorage.getItem('read_notifications') || '[]');
+        if (!readIds.includes(notifId)) {
+            readIds.push(notifId);
+            localStorage.setItem('read_notifications', JSON.stringify(readIds));
+            unreadCount = Math.max(0, unreadCount - 1);
+            updateBadge();
+            renderNotificationList();
+        }
+    };
+
+    function updateBadge() {
+        var badge = document.getElementById('notifBadge');
+        if (unreadCount > 0) {
+            badge.textContent = unreadCount > 9 ? '9+' : unreadCount;
+            badge.style.display = 'block';
+        } else {
+            badge.style.display = 'none';
+        }
+    }
+
+    function listenForNewNotifications() {
+        if (!db) return;
+        db.ref('admin_notifications').on('child_added', function(snapshot) {
+            var newNotif = snapshot.val();
+            var exists = notifications.some(function(n) { return n.id === newNotif.id; });
+            if (!exists) {
+                notifications.unshift(newNotif);
+                var readIds = JSON.parse(localStorage.getItem('read_notifications') || '[]');
+                if (!readIds.includes(newNotif.id)) {
+                    unreadCount++;
+                    updateBadge();
+                }
+                renderNotificationList();
+            }
+        });
+    }
+
+    function escapeHtml(str) {
+        if (!str) return '';
+        return str.replace(/[&<>]/g, function(m) {
+            return m === '&' ? '&amp;' : m === '<' ? '&lt;' : '&gt;';
+        });
+    }
+
+    function togglePanel() {
+        document.getElementById('notificationPanel').classList.toggle('open');
+    }
+
+    document.getElementById('notificationBell').addEventListener('click', togglePanel);
+    document.getElementById('closePanelBtn').addEventListener('click', function() {
+        document.getElementById('notificationPanel').classList.remove('open');
+    });
+    document.addEventListener('click', function(e) {
+        var panel = document.getElementById('notificationPanel');
+        var bell = document.getElementById('notificationBell');
+        if (panel.classList.contains('open') && !panel.contains(e.target) && !bell.contains(e.target)) {
+            panel.classList.remove('open');
+        }
+    });
+
+    // ─────────────────────────────────────────────
+    // INIT
+    // ─────────────────────────────────────────────
+    
+    initTheme();
+    renderBundles('mtn');
+    loadNotifications();
+    listenForNewNotifications();
+    checkMaintenanceStatus();
+    setInterval(checkMaintenanceStatus, 60000);
+
+    console.log('🔒 DataFlow GH - SECURE Frontend v3.0');
+    console.log('✅ Webhook-only delivery - NO /deliver calls');
+    console.log('📡 Backend:', BACKEND_URL);
+
+})();
+</script>
+</body>
+</html>`;
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  END OF FRONTEND HTML
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────
+//  SERVE FRONTEND DIRECTLY FROM SERVER
+// ─────────────────────────────────────────────
+
+app.get('/', (req, res) => {
+    // Inject config from server
+    const injectScript = `
+    <script>
+      window.__DF_CONFIG = {
+        paystackKey: "${process.env.PAYSTACK_PUBLIC_KEY || 'pk_live_ca0cb6cd18a148e6f9a915b4f8bd18be85d335b0'}",
+        backendUrl: "${process.env.BACKEND_URL || ''}"
+      };
+      console.log('🔒 Secure config loaded');
+    </script>
+    `;
+    
+    let html = FRONTEND_HTML;
+    html = html.replace('</head>', injectScript + '</head>');
+    res.send(html);
 });
 
 // ─────────────────────────────────────────────
@@ -421,16 +2369,11 @@ app.get('/', (req, res) => {
 
 function formatPhoneLocal(phone) {
     let p = String(phone).replace(/[\s\-]/g, "");
-
     if (p.startsWith("233")) p = "0" + p.slice(3);
     if (p.startsWith("+233")) p = "0" + p.slice(4);
     if (!p.startsWith("0")) p = "0" + p;
-
     if (!/^0\d{9}$/.test(p)) {
-        throw new AppError(
-            `Phone must be 10 digits starting with 0 (e.g., 0551234567), got: "${phone}"`,
-            400, "VALIDATION"
-        );
+        throw new AppError(`Phone must be 10 digits starting with 0 (e.g., 0551234567), got: "${phone}"`, 400, "VALIDATION");
     }
     return p;
 }
@@ -448,9 +2391,7 @@ async function getProfitSettings() {
     if (profitSettingsCache && (Date.now() - lastCacheUpdate) < CACHE_TTL) {
         return profitSettingsCache;
     }
-
     if (profitSettingsPromise) return profitSettingsPromise;
-
     profitSettingsPromise = (async () => {
         if (!db) {
             const defaultSettings = { mode: "flat", flatAmount: 0 };
@@ -470,14 +2411,12 @@ async function getProfitSettings() {
             profitSettingsPromise = null;
         }
     })();
-
     return profitSettingsPromise;
 }
 
 function applyProfit(costPrice, volumeInMB, network, settings) {
     if (!settings) return costPrice;
     const { mode, flatAmount = 0, percentAmount = 0, perBundle = {} } = settings;
-
     if (mode === "percent") {
         const pct = parseFloat(percentAmount) || 0;
         return Math.ceil(costPrice * (1 + pct / 100) * 20) / 20;
@@ -497,48 +2436,28 @@ function applyProfit(costPrice, volumeInMB, network, settings) {
 
 async function deliverViaRemaData(phone, networkType, volumeInMB, reference) {
     if (!REMADATA_API_KEY) {
-        throw new AppError(
-            "RemaData API not configured. Please set REMADATA_API_KEY environment variable.",
-            503, "CONFIGURATION"
-        );
+        throw new AppError("RemaData API not configured. Please set REMADATA_API_KEY environment variable.", 503, "CONFIGURATION");
     }
-
     const orderRef = reference || `DF-${Date.now()}`;
     const localPhone = formatPhoneLocal(phone);
     const remaMB = REMA_MB_MAP[Number(volumeInMB)] || Number(volumeInMB);
-
     let remaNetworkType = "mtn";
     if (networkType === "telecel") remaNetworkType = "telecel";
     if (networkType === "airteltigo") remaNetworkType = "airteltigo";
-
-    const payload = {
-        ref: orderRef,
-        phone: localPhone,
-        volumeInMB: remaMB,
-        networkType: remaNetworkType,
-    };
-
+    const payload = { ref: orderRef, phone: localPhone, volumeInMB: remaMB, networkType: remaNetworkType };
     console.log(`📦 [RemaData] ${volumeInMB}MB → ${remaMB}MB ${networkType} → ${localPhone} | Ref: ${orderRef}`);
-
     const response = await fetchWithRetry(async () => {
         return await axios.post(`${REMADATA_API_URL}/buy-data`, payload, {
             headers: { "X-API-KEY": REMADATA_API_KEY, "Content-Type": "application/json" },
             timeout: 30000,
         });
     });
-
     if (response.data?.status !== "success") {
         const providerMsg = response.data?.message || response.data?.error || "Unknown provider error";
-        throw new AppError(
-            `RemaData delivery rejected: ${providerMsg}`,
-            502, "PROVIDER",
-            { providerResponse: response.data }
-        );
+        throw new AppError(`RemaData delivery rejected: ${providerMsg}`, 502, "PROVIDER", { providerResponse: response.data });
     }
-
     const remaReference = response.data?.data?.reference || response.data?.reference || orderRef;
     console.log(`✅ [RemaData] Delivered | Provider ref: ${remaReference}`);
-
     return { success: true, reference: remaReference, data: response.data, provider: "RemaData" };
 }
 
@@ -549,25 +2468,15 @@ async function deliverViaRemaData(phone, networkType, volumeInMB, reference) {
 async function deliverData(phone, networkType, volumeInMB, reference = null) {
     const net = networkType?.toLowerCase();
     const providerConfig = NETWORK_PROVIDER[net];
-
     if (!providerConfig) {
-        throw new AppError(
-            `Unsupported network: "${networkType}". Valid: ${Object.keys(NETWORK_PROVIDER).join(", ")}`,
-            400, "VALIDATION"
-        );
+        throw new AppError(`Unsupported network: "${networkType}". Valid: ${Object.keys(NETWORK_PROVIDER).join(", ")}`, 400, "VALIDATION");
     }
-
     try {
         console.log(`📡 Delivering ${net} via RemaData`);
         return await deliverViaRemaData(phone, net, volumeInMB, reference);
     } catch (error) {
         const customerMessage = getCustomerFriendlyMessage(net, error.message);
-        throw new AppError(
-            customerMessage,
-            503,
-            "PROVIDER",
-            { network: net, provider: "RemaData", error: error.message }
-        );
+        throw new AppError(customerMessage, 503, "PROVIDER", { network: net, provider: "RemaData", error: error.message });
     }
 }
 
@@ -581,27 +2490,20 @@ function verifyPaystackSignature(rawBody, signature) {
     return hash === signature;
 }
 
-// Webhook endpoint - NO rate limiting needed, but we add it anyway
 app.post("/paystack/webhook", async (req, res) => {
     const signature = req.headers["x-paystack-signature"];
-
     if (!verifyPaystackSignature(req.rawBody, signature)) {
         console.warn("⚠️ Paystack webhook: invalid signature");
         return res.status(401).json({ error: "Invalid signature" });
     }
-
     const event = req.body;
     if (!event?.event) {
         console.error("❌ Webhook: empty or malformed body");
         return res.status(400).json({ error: "Invalid body" });
     }
-
     console.log(`📨 Webhook: ${event.event}`);
     res.status(200).json({ received: true });
-
-    // Only process charge.success events
     if (event.event !== "charge.success") return;
-
     const { data } = event;
     const meta = data.metadata || {};
     const phone = meta.phone || meta.customer_phone;
@@ -609,26 +2511,19 @@ app.post("/paystack/webhook", async (req, res) => {
     const volumeInMB = meta.volumeInMB || meta.volume_in_mb;
     const ref = data.reference;
     const amount = data.amount ? data.amount / 100 : 0;
-
     const baseOrderData = { ref, phone, networkType, volumeInMB, amount, source: "paystack_webhook" };
-
     if (!phone || !volumeInMB || !networkType) {
         console.warn(`⚠️ Webhook: missing metadata — phone=${phone}, volume=${volumeInMB}, network=${networkType}`);
         return;
     }
-
-    // Duplicate protection
     if (processedRefs.has(ref)) {
         console.warn(`⚠️ Webhook: duplicate ref ignored — ${ref}`);
         return;
     }
     processedRefs.set(ref, Date.now());
-
     console.log(`💳 Webhook auto-delivery: ${networkType} ${volumeInMB}MB → ${phone}`);
-
     try {
         const result = await deliverData(phone, networkType, Number(volumeInMB), ref);
-
         await saveOrderWithRetry(ref, {
             ...baseOrderData,
             status: "completed",
@@ -636,7 +2531,6 @@ app.post("/paystack/webhook", async (req, res) => {
             providerRef: result.reference,
             timestamp: new Date().toISOString(),
         });
-
         console.log(`✅ Webhook delivery complete | Provider: ${result.provider}`);
     } catch (err) {
         console.error(`❌ Webhook delivery failed: ${err.message}`);
@@ -646,19 +2540,14 @@ app.post("/paystack/webhook", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-//  API ROUTES (with rate limiting)
+//  API ROUTES
 // ─────────────────────────────────────────────
-
-app.get("/", (req, res) => {
-    res.json({ status: "online", service: "DataFlow GH", timestamp: new Date().toISOString() });
-});
 
 app.get("/health", (req, res) => {
     const criticalIssues = [];
     if (!REMADATA_API_KEY) criticalIssues.push("All deliveries will fail");
-    if (!DELIVER_SECRET) criticalIssues.push("Manual delivery endpoint unprotected");
+    if (!DELIVER_SECRET) criticalIssues.push("/deliver endpoint unprotected");
     if (!ALLOWED_ORIGINS.length) criticalIssues.push("CORS will deny all requests");
-
     res.json({
         status: criticalIssues.length > 0 ? "DEGRADED" : "OK",
         service: "DataFlow GH",
@@ -677,24 +2566,8 @@ app.get("/health", (req, res) => {
     });
 });
 
-app.get("/api/balance", limiter, asyncHandler(async (req, res) => {
-    if (!REMADATA_API_KEY) {
-        throw new AppError("RemaData API not configured", 503, "CONFIGURATION");
-    }
-    try {
-        const response = await axios.get(`${REMADATA_API_URL}/wallet-balance`, {
-            headers: { "X-API-KEY": REMADATA_API_KEY },
-            timeout: 10000,
-        });
-        res.json(response.data);
-    } catch (err) {
-        throw new AppError(`Failed to fetch balance: ${err.message}`, 502, "PROVIDER");
-    }
-}));
-
 app.get("/api/bundles", limiter, asyncHandler(async (req, res) => {
     const network = (req.query.network || "mtn").toLowerCase();
-
     const bundleData = {
         mtn: [
             { volumeInMB: 1024, volume: "1GB", price: 4.30, name: "1GB", network: "mtn" },
@@ -740,129 +2613,73 @@ app.get("/api/bundles", limiter, asyncHandler(async (req, res) => {
             { volumeInMB: 25600, volume: "25GB", price: 98.00, name: "25GB", network: "airteltigo" },
         ],
     };
-
     if (!bundleData[network]) {
         throw new AppError(`Unknown network "${network}"`, 400, "VALIDATION");
     }
-
     let bundles = bundleData[network];
-
     const settings = await getProfitSettings();
     bundles = bundles.map((b) => ({
         ...b,
         costPrice: b.price,
         price: applyProfit(b.price, b.volumeInMB, network, settings),
     }));
-
     res.json({ status: "success", data: bundles, count: bundles.length });
 }));
 
-// ─────────────────────────────────────────────
-//  ADMIN ROUTES - Protect with API Key!
-// ─────────────────────────────────────────────
-
-app.get("/api/profit-settings", requireApiKey, asyncHandler(async (req, res) => {
-    const settings = await getProfitSettings();
-    res.json({ status: "success", settings });
-}));
-
-app.post("/api/profit-settings", requireApiKey, asyncHandler(async (req, res) => {
-    const { mode, flatAmount, percentAmount, perBundle } = req.body;
-    const validModes = ["flat", "percent", "perBundle"];
-
-    if (!validModes.includes(mode)) {
-        throw new AppError(`Invalid mode "${mode}"`, 400, "VALIDATION");
+app.post("/deliver", requireApiKey, limiter, asyncHandler(async (req, res) => {
+    const { phone, networkType, volumeInMB, ref } = req.body;
+    if (!phone || !networkType || !volumeInMB) {
+        throw new AppError("Missing required fields: phone, networkType, volumeInMB", 400, "VALIDATION");
     }
-
-    const settings = {
-        mode,
-        flatAmount: parseFloat(flatAmount) || 0,
-        percentAmount: parseFloat(percentAmount) || 0,
-        perBundle: perBundle || {},
-        updatedAt: new Date().toISOString(),
-    };
-
-    if (db) {
-        try {
-            await db.ref("system/profitSettings").set(settings);
-        } catch (err) {
-            throw new AppError(`Failed to save settings: ${err.message}`, 500, "FIREBASE");
-        }
+    const validNetworks = Object.keys(NETWORK_PROVIDER);
+    if (!validNetworks.includes(networkType.toLowerCase())) {
+        throw new AppError(`Invalid network "${networkType}"`, 400, "VALIDATION");
     }
-
-    profitSettingsCache = settings;
-    lastCacheUpdate = Date.now();
-    profitSettingsPromise = null;
-
-    res.json({ status: "success", settings });
+    const volumeNum = Number(volumeInMB);
+    if (isNaN(volumeNum) || volumeNum <= 0) {
+        throw new AppError("volumeInMB must be a positive number", 400, "VALIDATION");
+    }
+    const result = await deliverData(phone, networkType.toLowerCase(), volumeNum, ref);
+    console.log(`✅ Manual delivery complete | Provider: ${result.provider}`);
+    res.json({ status: "success", provider: result.provider, reference: result.reference, data: result.data });
 }));
-
-// ─────────────────────────────────────────────
-//  ORDER STATUS - Secure lookup (NO full DB dump)
-// ─────────────────────────────────────────────
 
 app.get("/api/order-status/:reference", limiter, asyncHandler(async (req, res) => {
     const { reference } = req.params;
-
     if (!reference) {
         throw new AppError("Reference parameter is required", 400, "VALIDATION");
     }
-
-    // Sanitize input - only allow alphanumeric and dashes
     if (!/^[a-zA-Z0-9\-]+$/.test(reference)) {
         throw new AppError("Invalid reference format", 400, "VALIDATION");
     }
-
-    // Check Firebase first (with proper indexing)
     if (db) {
         try {
-            // Try to find by orderId or ref
             const snapshot = await db.ref('orders').orderByChild('orderId').equalTo(reference).once('value');
             const data = snapshot.val();
-            
             if (data) {
                 const order = Object.values(data)[0];
-                return res.json({
-                    status: "success",
-                    source: "firebase",
-                    order: order
-                });
+                return res.json({ status: "success", source: "firebase", order: order });
             }
-            
-            // Try by ref
             const refSnapshot = await db.ref('orders').orderByChild('ref').equalTo(reference).once('value');
             const refData = refSnapshot.val();
             if (refData) {
                 const order = Object.values(refData)[0];
-                return res.json({
-                    status: "success",
-                    source: "firebase",
-                    order: order
-                });
+                return res.json({ status: "success", source: "firebase", order: order });
             }
         } catch (err) {
             console.warn('Firebase lookup error:', err.message);
         }
     }
-
-    // Check RemaData
     if (!REMADATA_API_KEY) {
         throw new AppError("RemaData API not configured", 503, "CONFIGURATION");
     }
-
     try {
-        const response = await axios.get(
-            `${REMADATA_API_URL}/order-status/${encodeURIComponent(reference)}`,
-            { headers: { "X-API-KEY": REMADATA_API_KEY }, timeout: 10000 }
-        );
-
+        const response = await axios.get(`${REMADATA_API_URL}/order-status/${encodeURIComponent(reference)}`, {
+            headers: { "X-API-KEY": REMADATA_API_KEY },
+            timeout: 10000
+        });
         if (response.data?.status === "success") {
-            return res.json({
-                status: "success",
-                provider: "RemaData",
-                reference: reference,
-                data: response.data.data
-            });
+            return res.json({ status: "success", provider: "RemaData", reference: reference, data: response.data.data });
         } else {
             throw new AppError("Order not found", 404, "NOT_FOUND");
         }
@@ -874,37 +2691,50 @@ app.get("/api/order-status/:reference", limiter, asyncHandler(async (req, res) =
     }
 }));
 
-// ─────────────────────────────────────────────
-//  DELIVERY ENDPOINT - ONLY FOR WEBHOOK USE
-//  (Deprecated - kept for backward compatibility but requires API key)
-// ─────────────────────────────────────────────
+app.get("/api/profit-settings", requireApiKey, asyncHandler(async (req, res) => {
+    const settings = await getProfitSettings();
+    res.json({ status: "success", settings });
+}));
 
-app.post("/deliver", requireApiKey, limiter, asyncHandler(async (req, res) => {
-    const { phone, networkType, volumeInMB, ref } = req.body;
-
-    if (!phone || !networkType || !volumeInMB) {
-        throw new AppError("Missing required fields: phone, networkType, volumeInMB", 400, "VALIDATION");
+app.post("/api/profit-settings", requireApiKey, asyncHandler(async (req, res) => {
+    const { mode, flatAmount, percentAmount, perBundle } = req.body;
+    const validModes = ["flat", "percent", "perBundle"];
+    if (!validModes.includes(mode)) {
+        throw new AppError(`Invalid mode "${mode}"`, 400, "VALIDATION");
     }
-
-    const validNetworks = Object.keys(NETWORK_PROVIDER);
-    if (!validNetworks.includes(networkType.toLowerCase())) {
-        throw new AppError(`Invalid network "${networkType}"`, 400, "VALIDATION");
+    const settings = {
+        mode,
+        flatAmount: parseFloat(flatAmount) || 0,
+        percentAmount: parseFloat(percentAmount) || 0,
+        perBundle: perBundle || {},
+        updatedAt: new Date().toISOString(),
+    };
+    if (db) {
+        try {
+            await db.ref("system/profitSettings").set(settings);
+        } catch (err) {
+            throw new AppError(`Failed to save settings: ${err.message}`, 500, "FIREBASE");
+        }
     }
+    profitSettingsCache = settings;
+    lastCacheUpdate = Date.now();
+    profitSettingsPromise = null;
+    res.json({ status: "success", settings });
+}));
 
-    const volumeNum = Number(volumeInMB);
-    if (isNaN(volumeNum) || volumeNum <= 0) {
-        throw new AppError("volumeInMB must be a positive number", 400, "VALIDATION");
+app.get("/api/balance", limiter, asyncHandler(async (req, res) => {
+    if (!REMADATA_API_KEY) {
+        throw new AppError("RemaData API not configured", 503, "CONFIGURATION");
     }
-
-    const result = await deliverData(phone, networkType.toLowerCase(), volumeNum, ref);
-
-    console.log(`✅ Manual delivery complete | Provider: ${result.provider}`);
-    res.json({
-        status: "success",
-        provider: result.provider,
-        reference: result.reference,
-        data: result.data,
-    });
+    try {
+        const response = await axios.get(`${REMADATA_API_URL}/wallet-balance`, {
+            headers: { "X-API-KEY": REMADATA_API_KEY },
+            timeout: 10000,
+        });
+        res.json(response.data);
+    } catch (err) {
+        throw new AppError(`Failed to fetch balance: ${err.message}`, 502, "PROVIDER");
+    }
 }));
 
 // ─────────────────────────────────────────────
@@ -921,23 +2751,19 @@ app.use((err, req, res, next) => {
     const isOperational = err.isOperational === true;
     const statusCode = err.statusCode || 500;
     const category = err.category || "INTERNAL";
-
     if (isOperational) {
         console.warn(`⚠️ [${category}] ${err.message}`);
     } else {
         console.error(`💥 [UNHANDLED] ${err.message}\n${err.stack}`);
     }
-
     const body = {
         status: "error",
         category,
         message: isOperational ? err.message : "Internal server error",
     };
-
     if (err.details && process.env.NODE_ENV !== "production") {
         body.details = err.details;
     }
-
     res.status(statusCode).json(body);
 });
 
@@ -947,12 +2773,10 @@ app.use((err, req, res, next) => {
 
 process.on("SIGTERM", async () => {
     console.log("🛑 SIGTERM received, starting graceful shutdown...");
-
     if (failedSaveQueue.length > 0) {
         console.log(`📦 Processing ${failedSaveQueue.length} queued saves before shutdown...`);
         await processFailedSaveQueue();
     }
-
     console.log("✅ Graceful shutdown complete");
     process.exit(0);
 });
@@ -972,8 +2796,9 @@ app.listen(PORT, () => {
     const col = (label, ok) => `  ${label.padEnd(28)} ${ok ? "✅" : "❌"}`;
     console.log(`
 ╔══════════════════════════════════════════════════════════════╗
-║   🔒  DataFlow GH Backend — SECURE Production               ║
+║   🚀  DataFlow GH Backend — Running                         ║
 ║   📡  Port: ${String(PORT).padEnd(37)}║
+║   📁  No public folder needed - HTML served from server     ║
 ╠══════════════════════════════════════════════════════════════╣
 ${col("║  MTN → RemaData", !!REMADATA_API_KEY)}        ║
 ${col("║  Telecel → RemaData", !!REMADATA_API_KEY)}        ║
@@ -992,6 +2817,7 @@ ${col("║  CORS Origins", ALLOWED_ORIGINS.length > 0 ? ALLOWED_ORIGINS.join(", 
 ║  • 🟢 CORS defaults to deny all                            ║
 ║  • 🟢 Admin endpoints require API key                      ║
 ║  • 🟢 Order tracking uses indexed queries                  ║
+║  • 🟢 No public folder needed - HTML in server             ║
 ╚══════════════════════════════════════════════════════════════╝`);
 });
 
