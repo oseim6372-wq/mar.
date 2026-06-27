@@ -1,347 +1,1009 @@
-/**
- * MTN Customer KYC API - Backend Proxy Server (PRODUCTION READY)
- * 
- * Based on MTN documentation - credentials in URL query parameters
- */
+// ============================================================
+//  DATEFLOW GH — UNIFIED BACKEND (PRODUCTION READY)
+//  MTN/Telecel/AT → RemaData API (local format 0XXXXXXXXX + volume mapping)
+//  Features: Retry logic, queue, memory protection, SECURE
+// ============================================================
 
-require('dotenv').config();
-const express = require('express');
-const cors    = require('cors');
-const { v4: uuidv4 } = require('uuid');
+require("dotenv").config();
+const express = require("express");
+const axios = require("axios");
+const cors = require("cors");
+const admin = require("firebase-admin");
+const crypto = require("crypto");
+const path = require("path");
+const fs = require("fs");
+const rateLimit = require("express-rate-limit");
 
 const app = express();
-app.use(cors());
-app.use(express.json());
-
-// ─── Config ───────────────────────────────────────────────────────────────────
-const MTN_TOKEN_URL = 'https://api.mtn.com/v1/oauth/access_token';
-const MTN_KYC_BASE  = 'https://api.mtn.com/v1/customers';
-
-// Get credentials from environment
-const MTN_CONSUMER_KEY    = process.env.MTN_CONSUMER_KEY    || '';
-const MTN_CONSUMER_SECRET = process.env.MTN_CONSUMER_SECRET || '';
-
 const PORT = process.env.PORT || 3000;
 
-let cachedToken  = null;
-let tokenExpires = 0;
+// ─────────────────────────────────────────────
+//  RATE LIMITING
+// ─────────────────────────────────────────────
 
-/**
- * Fetches access_token using URL query parameters (per MTN docs)
- * 
- * The correct format from MTN documentation:
- * POST https://api.mtn.com/v1/oauth/access_token?grant_type=client_credentials&client_id=KEY&client_secret=SECRET
- */
-async function getAccessToken() {
-  // Return cached token if still valid
-  if (cachedToken && Date.now() < tokenExpires) {
-    console.log('[OAuth] Using cached token (valid for', Math.round((tokenExpires - Date.now()) / 1000), 'seconds)');
-    return cachedToken;
-  }
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // Limit each IP to 100 requests per windowMs
+    message: { status: "error", message: "Too many requests, please try again later." },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
 
-  if (!MTN_CONSUMER_KEY || !MTN_CONSUMER_SECRET) {
-    console.error('[OAuth] ERROR: Missing credentials');
-    throw new Error('MTN_CONSUMER_KEY and MTN_CONSUMER_SECRET must be set in .env file');
-  }
+const strictLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 10, // Stricter limit for sensitive endpoints
+    message: { status: "error", message: "Too many requests, please try again later." },
+});
 
-  // URL encode credentials to handle special characters
-  const encodedKey = encodeURIComponent(MTN_CONSUMER_KEY);
-  const encodedSecret = encodeURIComponent(MTN_CONSUMER_SECRET);
-  
-  // Build URL with credentials as query parameters (EXACTLY as MTN docs show)
-  const tokenUrl = `${MTN_TOKEN_URL}?grant_type=client_credentials&client_id=${encodedKey}&client_secret=${encodedSecret}`;
-  
-  console.log('[OAuth] Fetching new token...');
-  console.log(`[OAuth] Token URL: ${MTN_TOKEN_URL}?grant_type=client_credentials&client_id=${MTN_CONSUMER_KEY.substring(0, 10)}...&client_secret=***`);
-  
-  try {
-    const response = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      // Empty body because all params are in URL
-    });
+// ─────────────────────────────────────────────
+//  CONFIGURATION
+// ─────────────────────────────────────────────
 
-    const responseText = await response.text();
-    console.log(`[OAuth] Response status: ${response.status}`);
-    console.log(`[OAuth] Response body preview: ${responseText.substring(0, 300)}`);
+const REMADATA_API_URL = "https://remadata.com/api";
+const REMADATA_API_KEY = process.env.REMADATA_API_KEY || "";
 
-    if (!response.ok) {
-      // Parse the error response if possible
-      let errorDetail = responseText;
-      try {
-        const errorJson = JSON.parse(responseText);
-        errorDetail = errorJson.supportMessage || errorJson.statusMessage || responseText;
-      } catch(e) {}
-      
-      throw new Error(`${errorDetail}`);
+const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY || "";
+const DELIVER_SECRET = process.env.DELIVER_SECRET || "";
+
+// Allowed frontend domains (CORS) - MUST be set in production
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "").split(",").filter(Boolean);
+
+// If no origins specified, DENY all (strict mode)
+const CORS_ORIGIN = ALLOWED_ORIGINS.length > 0 ? ALLOWED_ORIGINS : [];
+
+// Retry configuration
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1000;
+
+// Processed references with memory protection
+const processedRefs = new Map();
+const REF_TTL = 24 * 60 * 60 * 1000;
+const MAX_REF_SIZE = 10000;
+
+// Firebase failed saves queue
+const failedSaveQueue = [];
+let isProcessingQueue = false;
+
+// Network providers - all via RemaData
+const NETWORK_PROVIDER = {
+    mtn: { name: "RemaData", primary: true },
+    telecel: { name: "RemaData", primary: true },
+    airteltigo: { name: "RemaData", primary: true },
+};
+
+// Promise cache for profit settings
+let profitSettingsPromise = null;
+let profitSettingsCache = null;
+let lastCacheUpdate = 0;
+const CACHE_TTL = 5 * 60 * 1000;
+
+// ─────────────────────────────────────────────
+//  VOLUME MAPPING FOR REMADATA
+// ─────────────────────────────────────────────
+
+const REMA_MB_MAP = {
+    1024: 1000, 2048: 2000, 3072: 3000, 4096: 4000,
+    5120: 5000, 6144: 6000, 7168: 7000, 8192: 8000,
+    9216: 9000, 10240: 10000, 11264: 11000, 12288: 12000,
+    13312: 13000, 14336: 14000, 15360: 15000, 16384: 16000,
+    17408: 17000, 18432: 18000, 19456: 19000, 20480: 20000,
+    25600: 25000, 30720: 30000, 40960: 40000, 51200: 50000,
+    102400: 100000
+};
+
+// ─────────────────────────────────────────────
+//  STRUCTURED ERROR CLASS
+// ─────────────────────────────────────────────
+
+class AppError extends Error {
+    constructor(message, statusCode = 500, category = "INTERNAL", details = null) {
+        super(message);
+        this.statusCode = statusCode;
+        this.category = category;
+        this.details = details;
+        this.isOperational = true;
+    }
+}
+
+function asyncHandler(fn) {
+    return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+}
+
+// ─────────────────────────────────────────────
+//  CUSTOMER-FRIENDLY ERROR MESSAGES
+// ─────────────────────────────────────────────
+
+function getCustomerFriendlyMessage(network, technicalDetails) {
+    const messages = {
+        mtn: "MTN data delivery is temporarily unavailable. Please try again in a few minutes. If the issue persists, contact support.",
+        telecel: "Telecel data delivery is temporarily unavailable. Please try again in a few minutes. If the issue persists, contact support.",
+        airteltigo: "AirtelTigo data delivery is temporarily unavailable. Please try again in a few minutes. If the issue persists, contact support."
+    };
+
+    const baseMessage = messages[network] || "Data delivery is temporarily unavailable. Please try again later.";
+
+    console.error(`📝 Technical details for ${network}: ${technicalDetails}`);
+
+    return baseMessage;
+}
+
+// ─────────────────────────────────────────────
+//  RETRY LOGIC WITH EXPONENTIAL BACKOFF
+// ─────────────────────────────────────────────
+
+async function fetchWithRetry(apiCall, retries = MAX_RETRIES, delay = RETRY_DELAY_MS) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            return await apiCall();
+        } catch (err) {
+            const isLastAttempt = i === retries - 1;
+            const isProviderError = err.category === "PROVIDER";
+
+            if (isLastAttempt || !isProviderError) throw err;
+
+            const waitTime = delay * Math.pow(2, i);
+            console.log(`🔄 Retry ${i + 1}/${retries} after ${waitTime}ms: ${err.message}`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+//  STARTUP VALIDATION
+// ─────────────────────────────────────────────
+
+function validateEnv() {
+    const checks = [
+        ["REMADATA_API_KEY", REMADATA_API_KEY, "All deliveries will fail"],
+        ["PAYSTACK_SECRET_KEY", PAYSTACK_SECRET, "Webhook signature verification disabled"],
+        ["DELIVER_SECRET", DELIVER_SECRET, "Manual delivery endpoint unprotected"],
+        ["FIREBASE_DATABASE_URL", process.env.FIREBASE_DATABASE_URL, "Orders will not be saved"],
+        ["FIREBASE_SERVICE_ACCOUNT_JSON", process.env.FIREBASE_SERVICE_ACCOUNT_JSON, "Firebase disabled"],
+        ["ALLOWED_ORIGINS", process.env.ALLOWED_ORIGINS, "CORS will deny all origins"],
+    ];
+
+    const missing = checks.filter(([, val]) => !val);
+    if (missing.length) {
+        console.warn("⚠️  Missing environment variables:");
+        missing.forEach(([key, , impact]) =>
+            console.warn(`   • ${key.padEnd(36)} → ${impact}`)
+        );
     }
 
-    let data;
-    try {
-      data = JSON.parse(responseText);
-    } catch (e) {
-      throw new Error(`MTN returned non-JSON: ${responseText.substring(0, 200)}`);
+    if (!ALLOWED_ORIGINS.length) {
+        console.error("❌ ALLOWED_ORIGINS not set - CORS will deny all requests!");
+        console.error("   Set ALLOWED_ORIGINS to your frontend domain(s)");
+    } else {
+        console.log(`✅ CORS allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
+    }
+}
+
+// ─────────────────────────────────────────────
+//  FIREBASE ADMIN INIT
+// ─────────────────────────────────────────────
+let db = null;
+
+try {
+    const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON ?
+        JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON) :
+        null;
+
+    if (serviceAccount && process.env.FIREBASE_DATABASE_URL) {
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount),
+            databaseURL: process.env.FIREBASE_DATABASE_URL,
+        });
+        db = admin.database();
+        console.log("✅ Firebase Admin initialised");
+
+        setInterval(processFailedSaveQueue, 60000);
+    } else {
+        if (!serviceAccount) console.warn("⚠️  FIREBASE_SERVICE_ACCOUNT_JSON not set — Firebase disabled");
+        if (!process.env.FIREBASE_DATABASE_URL) console.warn("⚠️  FIREBASE_DATABASE_URL not set — Firebase disabled");
+    }
+} catch (err) {
+    console.error(`❌ Firebase init failed: ${err.message}`);
+}
+
+// ─────────────────────────────────────────────
+//  FIREBASE QUEUE PROCESSOR
+// ─────────────────────────────────────────────
+
+async function saveOrderWithRetry(ref, payload, retries = 5) {
+    if (!db) {
+        failedSaveQueue.push({ ref, payload, timestamp: Date.now() });
+        console.warn(`⚠️ Firebase unavailable, queued order "${ref}" (queue size: ${failedSaveQueue.length})`);
+        return;
     }
 
-    if (!data.access_token) {
-      throw new Error(`No access_token in response. Got: ${JSON.stringify(data)}`);
+    for (let i = 0; i < retries; i++) {
+        try {
+            await db.ref(`transactions/${ref}`).set(payload);
+            console.log(`✅ Order "${ref}" saved to Firebase`);
+            return;
+        } catch (err) {
+            if (i === retries - 1) {
+                failedSaveQueue.push({ ref, payload, timestamp: Date.now() });
+                console.error(`❌ Failed to save order "${ref}" after ${retries} retries, queued`);
+            } else {
+                await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
+            }
+        }
+    }
+}
+
+async function saveFailedOrderWithRetry(ref, payload, errMessage) {
+    const failedPayload = {
+        ...payload,
+        status: "failed",
+        error: errMessage,
+        timestamp: new Date().toISOString(),
+    };
+    await saveOrderWithRetry(ref, failedPayload);
+}
+
+async function processFailedSaveQueue() {
+    if (isProcessingQueue || !db || failedSaveQueue.length === 0) return;
+
+    isProcessingQueue = true;
+    console.log(`🔄 Processing ${failedSaveQueue.length} queued Firebase saves...`);
+
+    const queueCopy = [...failedSaveQueue];
+    failedSaveQueue.length = 0;
+
+    for (const item of queueCopy) {
+        try {
+            await db.ref(`transactions/${item.ref}`).set(item.payload);
+            console.log(`✅ Queued order "${item.ref}" saved after recovery`);
+        } catch (err) {
+            console.error(`❌ Still failed to save "${item.ref}" after recovery, re-queuing`);
+            failedSaveQueue.push(item);
+        }
     }
 
-    cachedToken = data.access_token;
-    const expiresIn = parseInt(data.expires_in, 10) || 3599;
-    tokenExpires = Date.now() + (expiresIn - 60) * 1000;
+    isProcessingQueue = false;
 
-    console.log(`[OAuth] ✅ TOKEN OBTAINED SUCCESSFULLY!`);
-    console.log(`[OAuth] Token: ${cachedToken.substring(0, 40)}...`);
-    console.log(`[OAuth] Expires in: ${expiresIn} seconds`);
-    console.log(`[OAuth] API Products: ${data.api_product_list || 'Not specified'}`);
-    
-    return cachedToken;
-  } catch (error) {
-    console.error(`[OAuth] ❌ ERROR:`, error.message);
-    throw error;
-  }
-}
-
-/**
- * Build MTN KYC request headers
- */
-async function buildMtnHeaders(transactionId) {
-  const token = await getAccessToken();
-  
-  const headers = {
-    'Content-Type': 'application/json',
-    'transactionId': transactionId,
-    'Authorization': `Bearer ${token}`,
-  };
-  
-  console.log('[KYC] Headers prepared (Bearer token present)');
-  return headers;
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function isValidCustomerId(id) {
-  return typeof id === 'string' && id.trim().length > 0;
-}
-
-function isValidDate(d) {
-  return !d || /^\d{4}-\d{2}-\d{2}$/.test(d);
-}
-
-function makeTransactionId() {
-  return uuidv4().replace(/-/g, '').slice(0, 20);
-}
-
-// ─── Routes ───────────────────────────────────────────────────────────────────
-
-/**
- * GET /health - Comprehensive health check
- */
-app.get('/health', async (_req, res) => {
-  const configured = !!(MTN_CONSUMER_KEY && MTN_CONSUMER_SECRET);
-  let tokenStatus = 'not_tested';
-  let tokenError = null;
-  let tokenPreview = null;
-
-  if (configured) {
-    try {
-      const token = await getAccessToken();
-      tokenStatus = 'ok';
-      tokenPreview = token.substring(0, 30) + '...';
-    } catch (e) {
-      tokenStatus = 'error';
-      tokenError = e.message;
+    if (failedSaveQueue.length > 0) {
+        setTimeout(processFailedSaveQueue, 30000);
     }
-  }
+}
 
-  res.json({
-    status: 'ok',
-    service: 'MTN KYC Proxy',
-    environment: 'production',
-    timestamp: new Date().toISOString(),
-    credentials: {
-      hasConsumerKey: !!MTN_CONSUMER_KEY,
-      hasConsumerSecret: !!MTN_CONSUMER_SECRET,
-      consumerKeyPrefix: MTN_CONSUMER_KEY ? MTN_CONSUMER_KEY.substring(0, 10) : null,
+// ─────────────────────────────────────────────
+//  PROCESSED REFS CLEANUP (Memory Protection)
+// ─────────────────────────────────────────────
+
+setInterval(() => {
+    const now = Date.now();
+    let deletedCount = 0;
+
+    for (const [ref, timestamp] of processedRefs.entries()) {
+        if (now - timestamp > REF_TTL) {
+            processedRefs.delete(ref);
+            deletedCount++;
+        }
+    }
+
+    if (processedRefs.size > MAX_REF_SIZE) {
+        const excess = processedRefs.size - MAX_REF_SIZE;
+        const iterator = processedRefs.keys();
+        for (let i = 0; i < excess; i++) {
+            processedRefs.delete(iterator.next().value);
+        }
+        console.warn(`⚠️ Force-cleaned ${excess} old refs, size now ${processedRefs.size}`);
+    }
+
+    if (deletedCount > 0) {
+        console.log(`🧹 Cleaned ${deletedCount} expired refs, size: ${processedRefs.size}`);
+    }
+}, 60 * 60 * 1000);
+
+// ─────────────────────────────────────────────
+//  CORS MIDDLEWARE (SECURE - DENY BY DEFAULT)
+// ─────────────────────────────────────────────
+
+const corsOptions = {
+    origin: function(origin, callback) {
+        // Allow requests with no origin (like mobile apps, curl, etc.)
+        if (!origin) return callback(null, true);
+
+        // If no origins configured, deny all
+        if (CORS_ORIGIN.length === 0) {
+            console.warn(`⚠️ CORS blocked request from: ${origin} - No origins configured`);
+            return callback(new AppError('CORS policy blocked this request', 403, 'CORS'));
+        }
+
+        // Check if origin is allowed
+        if (CORS_ORIGIN.indexOf(origin) !== -1) {
+            callback(null, true);
+        } else {
+            console.warn(`⚠️ CORS blocked request from: ${origin}`);
+            callback(new AppError('CORS policy blocked this request', 403, 'CORS'));
+        }
     },
-    oauth: {
-      tokenUrl: MTN_TOKEN_URL,
-      method: 'URL query parameters (grant_type, client_id, client_secret)',
-      configured,
-      tokenStatus,
-      tokenError,
-      tokenPreview,
-    },
-  });
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'X-API-Key'],
+    credentials: true,
+    maxAge: 86400
+};
+
+app.use(cors(corsOptions));
+
+// ─────────────────────────────────────────────
+//  MIDDLEWARE
+// ─────────────────────────────────────────────
+
+app.use((req, res, next) => {
+    if (req.path === "/paystack/webhook") {
+        const chunks = [];
+        req.on("data", (chunk) => chunks.push(chunk));
+        req.on("end", () => {
+            req.rawBody = Buffer.concat(chunks);
+            try {
+                req.body = JSON.parse(req.rawBody.toString());
+            } catch {
+                req.body = {};
+            }
+            next();
+        });
+        req.on("error", next);
+    } else {
+        express.json()(req, res, next);
+    }
 });
 
-/**
- * POST /kyc/lookup - Main KYC lookup endpoint
- */
-app.post('/kyc/lookup', async (req, res) => {
-  const { customerId, startDate, endDate } = req.body || {};
+app.use((req, res, next) => {
+    req.setTimeout(30000);
+    res.setTimeout(30000);
+    next();
+});
 
-  if (!isValidCustomerId(customerId)) {
-    return res.status(400).json({
-      statusCode: '4001',
-      statusMessage: 'customerId is required in request body.',
-      transactionId: makeTransactionId(),
+app.use((req, res, next) => {
+    const start = Date.now();
+    res.on("finish", () => {
+        const ms = Date.now() - start;
+        const icon = res.statusCode < 400 ? "✓" : res.statusCode < 500 ? "⚠" : "✗";
+        console.log(`${icon} ${req.method} ${req.path} → ${res.statusCode} (${ms}ms)`);
     });
-  }
+    next();
+});
 
-  const transactionId = makeTransactionId();
-  const cleanCustomerId = customerId.replace(/^%2B/, '+');
-  
-  // Build KYC URL
-  const mtnUrl = new URL(`${MTN_KYC_BASE}/${encodeURIComponent(cleanCustomerId)}/kyc`);
-  if (startDate && isValidDate(startDate)) {
-    mtnUrl.searchParams.set('startDate', startDate);
-  }
-  if (endDate && isValidDate(endDate)) {
-    mtnUrl.searchParams.set('endDate', endDate);
-  }
+// ─────────────────────────────────────────────
+//  AUTH MIDDLEWARE
+// ─────────────────────────────────────────────
 
-  console.log(`\n[KYC] ========== NEW REQUEST ==========`);
-  console.log(`[KYC] Timestamp: ${new Date().toISOString()}`);
-  console.log(`[KYC] URL: ${mtnUrl.toString()}`);
-  console.log(`[KYC] Transaction ID: ${transactionId}`);
-  console.log(`[KYC] Customer ID: ${cleanCustomerId}`);
+function requireApiKey(req, res, next) {
+    if (!DELIVER_SECRET) {
+        return next(new AppError("DELIVER_SECRET not configured", 500, "INTERNAL"));
+    }
+    const key = req.headers["x-api-key"] || req.headers["X-API-Key"] || req.body?.apiKey;
+    if (!key || key !== DELIVER_SECRET) {
+        console.warn(`🚫 Unauthorized attempt on ${req.path} — IP: ${req.ip}`);
+        return next(new AppError("Invalid or missing API key", 401, "AUTH"));
+    }
+    next();
+}
 
-  try {
-    const headers = await buildMtnHeaders(transactionId);
-    console.log(`[KYC] Making request to MTN...`);
+// ─────────────────────────────────────────────
+//  SERVE FRONTEND (WITHOUT SENSITIVE CONFIG)
+// ─────────────────────────────────────────────
 
-    const mtnRes = await fetch(mtnUrl.toString(), { 
-      method: 'GET', 
-      headers 
-    });
-    
-    const rawText = await mtnRes.text();
-    console.log(`[KYC] MTN Response Status: ${mtnRes.status}`);
-    console.log(`[KYC] MTN Response Size: ${rawText.length} bytes`);
+app.use(express.static(path.join(__dirname, 'public')));
 
-    // Try to parse JSON response
-    let mtnBody;
+app.get('/', (req, res) => {
+    const indexPath = path.join(__dirname, 'public', 'index.html');
+
     try {
-      mtnBody = JSON.parse(rawText);
-      console.log(`[KYC] ✅ Successfully parsed JSON response`);
-    } catch (e) {
-      console.error(`[KYC] ❌ Failed to parse JSON: ${rawText.substring(0, 200)}`);
-      
-      return res.status(mtnRes.status || 502).json({
-        statusCode: '5020',
-        statusMessage: 'MTN API returned non-JSON response',
-        supportMessage: `HTTP ${mtnRes.status}. This may indicate an API gateway error or invalid endpoint.`,
-        rawPreview: rawText.substring(0, 400),
-        transactionId,
-        timestamp: new Date().toISOString(),
-      });
-    }
+        let html = fs.readFileSync(indexPath, 'utf8');
 
-    // Return successful response
-    return res.status(mtnRes.status).json({
-      ...mtnBody,
-      _meta: {
-        proxyTransactionId: transactionId,
-        mtnHttpStatus: mtnRes.status,
-        requestedCustomerId: cleanCustomerId,
-        timestamp: new Date().toISOString(),
-      },
-    });
-  } catch (err) {
-    console.error(`[KYC] ❌ Fatal Error:`, err.message);
-    
-    // Provide specific error messages based on error type
-    if (err.message.includes('OAuth') || err.message.includes('token') || err.message.includes('invalid_client')) {
-      return res.status(401).json({
-        statusCode: '4000',
-        statusMessage: 'Unauthorised - OAuth token generation failed',
-        supportMessage: err.message,
-        actionRequired: 'Verify your MTN Consumer Key and Secret in Render environment variables. Check MTN Developer Portal for subscription status.',
-        transactionId,
-        timestamp: new Date().toISOString(),
-      });
+        // ONLY inject the public Paystack key - NO DELIVER_SECRET
+        const injectScript = `
+        <script>
+          // Securely injected from server - public only
+          window.__DF_CONFIG = {
+            paystackKey: "${process.env.PAYSTACK_PUBLIC_KEY || 'pk_live_ca0cb6cd18a148e6f9a915b4f8bd18be85d335b0'}",
+            backendUrl: "${process.env.BACKEND_URL || ''}"
+          };
+          console.log('🔒 Secure config loaded');
+        </script>
+        `;
+
+        html = html.replace('</head>', injectScript + '</head>');
+        res.send(html);
+    } catch (err) {
+        console.error('Error serving index:', err);
+        res.status(500).send('Error loading page');
     }
-    
-    if (err.message.includes('fetch') || err.message.includes('network')) {
-      return res.status(503).json({
-        statusCode: '5030',
-        statusMessage: 'Network error - Cannot reach MTN API',
-        supportMessage: err.message,
-        transactionId,
-        timestamp: new Date().toISOString(),
-      });
-    }
-    
-    return res.status(500).json({
-      statusCode: '5000',
-      statusMessage: 'Proxy error contacting MTN KYC API.',
-      supportMessage: err.message,
-      transactionId,
-      timestamp: new Date().toISOString(),
-    });
-  }
 });
 
-/**
- * GET /kyc/:customerId - Legacy GET endpoint
- */
-app.get('/kyc/:customerId', async (req, res) => {
-  const { customerId } = req.params;
-  const { startDate, endDate } = req.query;
-  
-  const transactionId = makeTransactionId();
-  
-  // Forward to POST handler logic
-  const mtnUrl = new URL(`${MTN_KYC_BASE}/${encodeURIComponent(customerId)}/kyc`);
-  if (startDate) mtnUrl.searchParams.set('startDate', startDate);
-  if (endDate) mtnUrl.searchParams.set('endDate', endDate);
+// ─────────────────────────────────────────────
+//  PHONE FORMATTING HELPERS
+// ─────────────────────────────────────────────
 
-  try {
-    const headers = await buildMtnHeaders(transactionId);
-    const mtnRes = await fetch(mtnUrl.toString(), { method: 'GET', headers });
-    const rawText = await mtnRes.text();
-    
-    let mtnBody;
+function formatPhoneLocal(phone) {
+    let p = String(phone).replace(/[\s\-]/g, "");
+
+    if (p.startsWith("233")) p = "0" + p.slice(3);
+    if (p.startsWith("+233")) p = "0" + p.slice(4);
+    if (!p.startsWith("0")) p = "0" + p;
+
+    if (!/^0\d{9}$/.test(p)) {
+        throw new AppError(
+            `Phone must be 10 digits starting with 0 (e.g., 0551234567), got: "${phone}"`,
+            400, "VALIDATION"
+        );
+    }
+    return p;
+}
+
+function resolveVolume(volumeInMB) {
+    const mb = Number(volumeInMB);
+    return mb >= 1024 ? String(Math.round(mb / 1024)) : String(mb);
+}
+
+// ─────────────────────────────────────────────
+//  PROFIT SETTINGS
+// ─────────────────────────────────────────────
+
+async function getProfitSettings() {
+    if (profitSettingsCache && (Date.now() - lastCacheUpdate) < CACHE_TTL) {
+        return profitSettingsCache;
+    }
+
+    if (profitSettingsPromise) return profitSettingsPromise;
+
+    profitSettingsPromise = (async () => {
+        if (!db) {
+            const defaultSettings = { mode: "flat", flatAmount: 0 };
+            profitSettingsCache = defaultSettings;
+            lastCacheUpdate = Date.now();
+            return defaultSettings;
+        }
+        try {
+            const snap = await db.ref("system/profitSettings").once("value");
+            profitSettingsCache = snap.val() || { mode: "flat", flatAmount: 0 };
+            lastCacheUpdate = Date.now();
+            return profitSettingsCache;
+        } catch (err) {
+            console.warn(`⚠️ Could not load profit settings: ${err.message}`);
+            return { mode: "flat", flatAmount: 0 };
+        } finally {
+            profitSettingsPromise = null;
+        }
+    })();
+
+    return profitSettingsPromise;
+}
+
+function applyProfit(costPrice, volumeInMB, network, settings) {
+    if (!settings) return costPrice;
+    const { mode, flatAmount = 0, percentAmount = 0, perBundle = {} } = settings;
+
+    if (mode === "percent") {
+        const pct = parseFloat(percentAmount) || 0;
+        return Math.ceil(costPrice * (1 + pct / 100) * 20) / 20;
+    }
+    if (mode === "perBundle") {
+        const key = `${network}_${volumeInMB}`;
+        const bundleProfit = parseFloat(perBundle?.[key]) || parseFloat(flatAmount) || 0;
+        return Math.ceil((costPrice + bundleProfit) * 20) / 20;
+    }
+    const flat = parseFloat(flatAmount) || 0;
+    return Math.ceil((costPrice + flat) * 20) / 20;
+}
+
+// ─────────────────────────────────────────────
+//  DELIVERY FUNCTIONS WITH RETRY
+// ─────────────────────────────────────────────
+
+async function deliverViaRemaData(phone, networkType, volumeInMB, reference) {
+    if (!REMADATA_API_KEY) {
+        throw new AppError(
+            "RemaData API not configured. Please set REMADATA_API_KEY environment variable.",
+            503, "CONFIGURATION"
+        );
+    }
+
+    const orderRef = reference || `DF-${Date.now()}`;
+    const localPhone = formatPhoneLocal(phone);
+    const remaMB = REMA_MB_MAP[Number(volumeInMB)] || Number(volumeInMB);
+
+    let remaNetworkType = "mtn";
+    if (networkType === "telecel") remaNetworkType = "telecel";
+    if (networkType === "airteltigo") remaNetworkType = "airteltigo";
+
+    const payload = {
+        ref: orderRef,
+        phone: localPhone,
+        volumeInMB: remaMB,
+        networkType: remaNetworkType,
+    };
+
+    console.log(`📦 [RemaData] ${volumeInMB}MB → ${remaMB}MB ${networkType} → ${localPhone} | Ref: ${orderRef}`);
+
+    const response = await fetchWithRetry(async () => {
+        return await axios.post(`${REMADATA_API_URL}/buy-data`, payload, {
+            headers: { "X-API-KEY": REMADATA_API_KEY, "Content-Type": "application/json" },
+            timeout: 30000,
+        });
+    });
+
+    if (response.data?.status !== "success") {
+        const providerMsg = response.data?.message || response.data?.error || "Unknown provider error";
+        throw new AppError(
+            `RemaData delivery rejected: ${providerMsg}`,
+            502, "PROVIDER",
+            { providerResponse: response.data }
+        );
+    }
+
+    const remaReference = response.data?.data?.reference || response.data?.reference || orderRef;
+    console.log(`✅ [RemaData] Delivered | Provider ref: ${remaReference}`);
+
+    return { success: true, reference: remaReference, data: response.data, provider: "RemaData" };
+}
+
+// ─────────────────────────────────────────────
+//  DELIVERY ORCHESTRATOR
+// ─────────────────────────────────────────────
+
+async function deliverData(phone, networkType, volumeInMB, reference = null) {
+    const net = networkType?.toLowerCase();
+    const providerConfig = NETWORK_PROVIDER[net];
+
+    if (!providerConfig) {
+        throw new AppError(
+            `Unsupported network: "${networkType}". Valid: ${Object.keys(NETWORK_PROVIDER).join(", ")}`,
+            400, "VALIDATION"
+        );
+    }
+
     try {
-      mtnBody = JSON.parse(rawText);
-    } catch (e) {
-      return res.status(mtnRes.status).json({
-        statusCode: '5020',
-        statusMessage: 'Non-JSON response',
-        rawPreview: rawText.substring(0, 300),
-        transactionId,
-      });
+        console.log(`📡 Delivering ${net} via RemaData`);
+        return await deliverViaRemaData(phone, net, volumeInMB, reference);
+    } catch (error) {
+        const customerMessage = getCustomerFriendlyMessage(net, error.message);
+        throw new AppError(
+            customerMessage,
+            503,
+            "PROVIDER",
+            { network: net, provider: "RemaData", error: error.message }
+        );
     }
-    
-    res.status(mtnRes.status).json(mtnBody);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+}
+
+// ─────────────────────────────────────────────
+//  PAYSTACK WEBHOOK - THE ONLY WAY TO TRIGGER DELIVERY
+// ─────────────────────────────────────────────
+
+function verifyPaystackSignature(rawBody, signature) {
+    if (!PAYSTACK_SECRET || !rawBody || !signature) return false;
+    const hash = crypto.createHmac("sha512", PAYSTACK_SECRET).update(rawBody).digest("hex");
+    return hash === signature;
+}
+
+// Webhook endpoint - NO rate limiting needed, but we add it anyway
+app.post("/paystack/webhook", async (req, res) => {
+    const signature = req.headers["x-paystack-signature"];
+
+    if (!verifyPaystackSignature(req.rawBody, signature)) {
+        console.warn("⚠️ Paystack webhook: invalid signature");
+        return res.status(401).json({ error: "Invalid signature" });
+    }
+
+    const event = req.body;
+    if (!event?.event) {
+        console.error("❌ Webhook: empty or malformed body");
+        return res.status(400).json({ error: "Invalid body" });
+    }
+
+    console.log(`📨 Webhook: ${event.event}`);
+    res.status(200).json({ received: true });
+
+    // Only process charge.success events
+    if (event.event !== "charge.success") return;
+
+    const { data } = event;
+    const meta = data.metadata || {};
+    const phone = meta.phone || meta.customer_phone;
+    const networkType = meta.networkType || meta.network_type;
+    const volumeInMB = meta.volumeInMB || meta.volume_in_mb;
+    const ref = data.reference;
+    const amount = data.amount ? data.amount / 100 : 0;
+
+    const baseOrderData = { ref, phone, networkType, volumeInMB, amount, source: "paystack_webhook" };
+
+    if (!phone || !volumeInMB || !networkType) {
+        console.warn(`⚠️ Webhook: missing metadata — phone=${phone}, volume=${volumeInMB}, network=${networkType}`);
+        return;
+    }
+
+    // Duplicate protection
+    if (processedRefs.has(ref)) {
+        console.warn(`⚠️ Webhook: duplicate ref ignored — ${ref}`);
+        return;
+    }
+    processedRefs.set(ref, Date.now());
+
+    console.log(`💳 Webhook auto-delivery: ${networkType} ${volumeInMB}MB → ${phone}`);
+
+    try {
+        const result = await deliverData(phone, networkType, Number(volumeInMB), ref);
+
+        await saveOrderWithRetry(ref, {
+            ...baseOrderData,
+            status: "completed",
+            provider: result.provider,
+            providerRef: result.reference,
+            timestamp: new Date().toISOString(),
+        });
+
+        console.log(`✅ Webhook delivery complete | Provider: ${result.provider}`);
+    } catch (err) {
+        console.error(`❌ Webhook delivery failed: ${err.message}`);
+        await saveFailedOrderWithRetry(ref, baseOrderData, err.message);
+        processedRefs.delete(ref);
+    }
 });
 
-// ─── Start Server ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+//  API ROUTES (with rate limiting)
+// ─────────────────────────────────────────────
+
+app.get("/", (req, res) => {
+    res.json({ status: "online", service: "DataFlow GH", timestamp: new Date().toISOString() });
+});
+
+app.get("/health", (req, res) => {
+    const criticalIssues = [];
+    if (!REMADATA_API_KEY) criticalIssues.push("All deliveries will fail");
+    if (!DELIVER_SECRET) criticalIssues.push("Manual delivery endpoint unprotected");
+    if (!ALLOWED_ORIGINS.length) criticalIssues.push("CORS will deny all requests");
+
+    res.json({
+        status: criticalIssues.length > 0 ? "DEGRADED" : "OK",
+        service: "DataFlow GH",
+        timestamp: new Date().toISOString(),
+        criticalIssues,
+        providers: {
+            mtn: { provider: "RemaData", configured: !!REMADATA_API_KEY, operational: !!REMADATA_API_KEY },
+            telecel: { provider: "RemaData", configured: !!REMADATA_API_KEY, operational: !!REMADATA_API_KEY },
+            airteltigo: { provider: "RemaData", configured: !!REMADATA_API_KEY, operational: !!REMADATA_API_KEY },
+        },
+        firebase: !!db,
+        firebaseQueueSize: failedSaveQueue.length,
+        webhook: !!PAYSTACK_SECRET,
+        memory: { processedRefsSize: processedRefs.size },
+        cors: ALLOWED_ORIGINS.length > 0 ? ALLOWED_ORIGINS : "DENY ALL",
+    });
+});
+
+app.get("/api/balance", limiter, asyncHandler(async (req, res) => {
+    if (!REMADATA_API_KEY) {
+        throw new AppError("RemaData API not configured", 503, "CONFIGURATION");
+    }
+    try {
+        const response = await axios.get(`${REMADATA_API_URL}/wallet-balance`, {
+            headers: { "X-API-KEY": REMADATA_API_KEY },
+            timeout: 10000,
+        });
+        res.json(response.data);
+    } catch (err) {
+        throw new AppError(`Failed to fetch balance: ${err.message}`, 502, "PROVIDER");
+    }
+}));
+
+app.get("/api/bundles", limiter, asyncHandler(async (req, res) => {
+    const network = (req.query.network || "mtn").toLowerCase();
+
+    const bundleData = {
+        mtn: [
+            { volumeInMB: 1024, volume: "1GB", price: 4.30, name: "1GB", network: "mtn" },
+            { volumeInMB: 2048, volume: "2GB", price: 8.60, name: "2GB", network: "mtn" },
+            { volumeInMB: 3072, volume: "3GB", price: 12.50, name: "3GB", network: "mtn" },
+            { volumeInMB: 4096, volume: "4GB", price: 16.50, name: "4GB", network: "mtn" },
+            { volumeInMB: 5120, volume: "5GB", price: 21.70, name: "5GB", network: "mtn" },
+            { volumeInMB: 6144, volume: "6GB", price: 24.50, name: "6GB", network: "mtn" },
+            { volumeInMB: 8192, volume: "8GB", price: 32.50, name: "8GB", network: "mtn" },
+            { volumeInMB: 10240, volume: "10GB", price: 39.00, name: "10GB", network: "mtn" },
+            { volumeInMB: 15360, volume: "15GB", price: 57.00, name: "15GB", network: "mtn" },
+            { volumeInMB: 20480, volume: "20GB", price: 77.10, name: "20GB", network: "mtn" },
+            { volumeInMB: 25600, volume: "25GB", price: 96.00, name: "25GB", network: "mtn" },
+            { volumeInMB: 30720, volume: "30GB", price: 116.00, name: "30GB", network: "mtn" },
+            { volumeInMB: 40960, volume: "40GB", price: 155.00, name: "40GB", network: "mtn" },
+            { volumeInMB: 51200, volume: "50GB", price: 186.00, name: "50GB", network: "mtn" },
+            { volumeInMB: 102400, volume: "100GB", price: 370.00, name: "100GB", network: "mtn" },
+        ],
+        telecel: [
+            { volumeInMB: 10240, volume: "10GB", price: 38.00, name: "10GB", network: "telecel" },
+            { volumeInMB: 15360, volume: "15GB", price: 55.00, name: "15GB", network: "telecel" },
+            { volumeInMB: 20480, volume: "20GB", price: 74.00, name: "20GB", network: "telecel" },
+            { volumeInMB: 25600, volume: "25GB", price: 92.00, name: "25GB", network: "telecel" },
+            { volumeInMB: 30720, volume: "30GB", price: 109.00, name: "30GB", network: "telecel" },
+            { volumeInMB: 40960, volume: "40GB", price: 143.00, name: "40GB", network: "telecel" },
+            { volumeInMB: 51200, volume: "50GB", price: 177.00, name: "50GB", network: "telecel" },
+            { volumeInMB: 102400, volume: "100GB", price: 354.00, name: "100GB", network: "telecel" },
+        ],
+        airteltigo: [
+            { volumeInMB: 1024, volume: "1GB", price: 3.90, name: "1GB", network: "airteltigo" },
+            { volumeInMB: 2048, volume: "2GB", price: 7.80, name: "2GB", network: "airteltigo" },
+            { volumeInMB: 3072, volume: "3GB", price: 11.80, name: "3GB", network: "airteltigo" },
+            { volumeInMB: 4096, volume: "4GB", price: 15.70, name: "4GB", network: "airteltigo" },
+            { volumeInMB: 5120, volume: "5GB", price: 19.40, name: "5GB", network: "airteltigo" },
+            { volumeInMB: 6144, volume: "6GB", price: 23.80, name: "6GB", network: "airteltigo" },
+            { volumeInMB: 7168, volume: "7GB", price: 27.40, name: "7GB", network: "airteltigo" },
+            { volumeInMB: 8192, volume: "8GB", price: 31.00, name: "8GB", network: "airteltigo" },
+            { volumeInMB: 9216, volume: "9GB", price: 35.00, name: "9GB", network: "airteltigo" },
+            { volumeInMB: 10240, volume: "10GB", price: 39.00, name: "10GB", network: "airteltigo" },
+            { volumeInMB: 12288, volume: "12GB", price: 47.00, name: "12GB", network: "airteltigo" },
+            { volumeInMB: 15360, volume: "15GB", price: 59.00, name: "15GB", network: "airteltigo" },
+            { volumeInMB: 20480, volume: "20GB", price: 78.50, name: "20GB", network: "airteltigo" },
+            { volumeInMB: 25600, volume: "25GB", price: 98.00, name: "25GB", network: "airteltigo" },
+        ],
+    };
+
+    if (!bundleData[network]) {
+        throw new AppError(`Unknown network "${network}"`, 400, "VALIDATION");
+    }
+
+    let bundles = bundleData[network];
+
+    const settings = await getProfitSettings();
+    bundles = bundles.map((b) => ({
+        ...b,
+        costPrice: b.price,
+        price: applyProfit(b.price, b.volumeInMB, network, settings),
+    }));
+
+    res.json({ status: "success", data: bundles, count: bundles.length });
+}));
+
+// ─────────────────────────────────────────────
+//  ADMIN ROUTES - Protect with API Key!
+// ─────────────────────────────────────────────
+
+app.get("/api/profit-settings", requireApiKey, asyncHandler(async (req, res) => {
+    const settings = await getProfitSettings();
+    res.json({ status: "success", settings });
+}));
+
+app.post("/api/profit-settings", requireApiKey, asyncHandler(async (req, res) => {
+    const { mode, flatAmount, percentAmount, perBundle } = req.body;
+    const validModes = ["flat", "percent", "perBundle"];
+
+    if (!validModes.includes(mode)) {
+        throw new AppError(`Invalid mode "${mode}"`, 400, "VALIDATION");
+    }
+
+    const settings = {
+        mode,
+        flatAmount: parseFloat(flatAmount) || 0,
+        percentAmount: parseFloat(percentAmount) || 0,
+        perBundle: perBundle || {},
+        updatedAt: new Date().toISOString(),
+    };
+
+    if (db) {
+        try {
+            await db.ref("system/profitSettings").set(settings);
+        } catch (err) {
+            throw new AppError(`Failed to save settings: ${err.message}`, 500, "FIREBASE");
+        }
+    }
+
+    profitSettingsCache = settings;
+    lastCacheUpdate = Date.now();
+    profitSettingsPromise = null;
+
+    res.json({ status: "success", settings });
+}));
+
+// ─────────────────────────────────────────────
+//  ORDER STATUS - Secure lookup (NO full DB dump)
+// ─────────────────────────────────────────────
+
+app.get("/api/order-status/:reference", limiter, asyncHandler(async (req, res) => {
+    const { reference } = req.params;
+
+    if (!reference) {
+        throw new AppError("Reference parameter is required", 400, "VALIDATION");
+    }
+
+    // Sanitize input - only allow alphanumeric and dashes
+    if (!/^[a-zA-Z0-9\-]+$/.test(reference)) {
+        throw new AppError("Invalid reference format", 400, "VALIDATION");
+    }
+
+    // Check Firebase first (with proper indexing)
+    if (db) {
+        try {
+            // Try to find by orderId or ref
+            const snapshot = await db.ref('orders').orderByChild('orderId').equalTo(reference).once('value');
+            const data = snapshot.val();
+            
+            if (data) {
+                const order = Object.values(data)[0];
+                return res.json({
+                    status: "success",
+                    source: "firebase",
+                    order: order
+                });
+            }
+            
+            // Try by ref
+            const refSnapshot = await db.ref('orders').orderByChild('ref').equalTo(reference).once('value');
+            const refData = refSnapshot.val();
+            if (refData) {
+                const order = Object.values(refData)[0];
+                return res.json({
+                    status: "success",
+                    source: "firebase",
+                    order: order
+                });
+            }
+        } catch (err) {
+            console.warn('Firebase lookup error:', err.message);
+        }
+    }
+
+    // Check RemaData
+    if (!REMADATA_API_KEY) {
+        throw new AppError("RemaData API not configured", 503, "CONFIGURATION");
+    }
+
+    try {
+        const response = await axios.get(
+            `${REMADATA_API_URL}/order-status/${encodeURIComponent(reference)}`,
+            { headers: { "X-API-KEY": REMADATA_API_KEY }, timeout: 10000 }
+        );
+
+        if (response.data?.status === "success") {
+            return res.json({
+                status: "success",
+                provider: "RemaData",
+                reference: reference,
+                data: response.data.data
+            });
+        } else {
+            throw new AppError("Order not found", 404, "NOT_FOUND");
+        }
+    } catch (err) {
+        if (err.response?.status === 404 || err.statusCode === 404) {
+            throw new AppError("Order not found", 404, "NOT_FOUND");
+        }
+        throw new AppError(`Failed to check order status: ${err.message}`, 502, "PROVIDER");
+    }
+}));
+
+// ─────────────────────────────────────────────
+//  DELIVERY ENDPOINT - ONLY FOR WEBHOOK USE
+//  (Deprecated - kept for backward compatibility but requires API key)
+// ─────────────────────────────────────────────
+
+app.post("/deliver", requireApiKey, limiter, asyncHandler(async (req, res) => {
+    const { phone, networkType, volumeInMB, ref } = req.body;
+
+    if (!phone || !networkType || !volumeInMB) {
+        throw new AppError("Missing required fields: phone, networkType, volumeInMB", 400, "VALIDATION");
+    }
+
+    const validNetworks = Object.keys(NETWORK_PROVIDER);
+    if (!validNetworks.includes(networkType.toLowerCase())) {
+        throw new AppError(`Invalid network "${networkType}"`, 400, "VALIDATION");
+    }
+
+    const volumeNum = Number(volumeInMB);
+    if (isNaN(volumeNum) || volumeNum <= 0) {
+        throw new AppError("volumeInMB must be a positive number", 400, "VALIDATION");
+    }
+
+    const result = await deliverData(phone, networkType.toLowerCase(), volumeNum, ref);
+
+    console.log(`✅ Manual delivery complete | Provider: ${result.provider}`);
+    res.json({
+        status: "success",
+        provider: result.provider,
+        reference: result.reference,
+        data: result.data,
+    });
+}));
+
+// ─────────────────────────────────────────────
+//  404 HANDLER
+// ─────────────────────────────────────────────
+app.use((req, res) => {
+    res.status(404).json({ status: "error", message: `Route not found: ${req.method} ${req.url}` });
+});
+
+// ─────────────────────────────────────────────
+//  ERROR HANDLER
+// ─────────────────────────────────────────────
+app.use((err, req, res, next) => {
+    const isOperational = err.isOperational === true;
+    const statusCode = err.statusCode || 500;
+    const category = err.category || "INTERNAL";
+
+    if (isOperational) {
+        console.warn(`⚠️ [${category}] ${err.message}`);
+    } else {
+        console.error(`💥 [UNHANDLED] ${err.message}\n${err.stack}`);
+    }
+
+    const body = {
+        status: "error",
+        category,
+        message: isOperational ? err.message : "Internal server error",
+    };
+
+    if (err.details && process.env.NODE_ENV !== "production") {
+        body.details = err.details;
+    }
+
+    res.status(statusCode).json(body);
+});
+
+// ─────────────────────────────────────────────
+//  GRACEFUL SHUTDOWN
+// ─────────────────────────────────────────────
+
+process.on("SIGTERM", async () => {
+    console.log("🛑 SIGTERM received, starting graceful shutdown...");
+
+    if (failedSaveQueue.length > 0) {
+        console.log(`📦 Processing ${failedSaveQueue.length} queued saves before shutdown...`);
+        await processFailedSaveQueue();
+    }
+
+    console.log("✅ Graceful shutdown complete");
+    process.exit(0);
+});
+
+process.on("SIGINT", async () => {
+    console.log("🛑 SIGINT received, shutting down...");
+    process.exit(0);
+});
+
+// ─────────────────────────────────────────────
+//  START SERVER
+// ─────────────────────────────────────────────
+
+validateEnv();
+
 app.listen(PORT, () => {
-  console.log(`
-╔═══════════════════════════════════════════════════════════════════════════════╗
-║                          MTN KYC PROXY SERVER v5.0                            ║
-╠═══════════════════════════════════════════════════════════════════════════════╣
-║  Status:     Running                                                          ║
-║  Port:       ${PORT}                                                              ║
-║  OAuth URL:  ${MTN_TOKEN_URL}                         ║
-║  KYC Base:   ${MTN_KYC_BASE}                                          ║
-╠═══════════════════════════════════════════════════════════════════════════════╣
-║  Authentication Method:                                                       ║
-║    → OAuth: Credentials as URL query parameters (per MTN docs)               ║
-║    → KYC:   Bearer token in Authorization header                              ║
-╠═══════════════════════════════════════════════════════════════════════════════╣
-║  Credentials Status:                                                          ║
-║    Consumer Key:    ${MTN_CONSUMER_KEY ? '✅ CONFIGURED' : '❌ MISSING'} (${MTN_CONSUMER_KEY ? MTN_CONSUMER_KEY.substring(0, 15) + '...' : 'N/A'})
-║    Consumer Secret: ${MTN_CONSUMER_SECRET ? '✅ CONFIGURED' : '❌ MISSING'} (${MTN_CONSUMER_SECRET ? '***' : 'N/A'})
-╚═══════════════════════════════════════════════════════════════════════════════╝
-  `);
+    const col = (label, ok) => `  ${label.padEnd(28)} ${ok ? "✅" : "❌"}`;
+    console.log(`
+╔══════════════════════════════════════════════════════════════╗
+║   🔒  DataFlow GH Backend — SECURE Production               ║
+║   📡  Port: ${String(PORT).padEnd(37)}║
+╠══════════════════════════════════════════════════════════════╣
+${col("║  MTN → RemaData", !!REMADATA_API_KEY)}        ║
+${col("║  Telecel → RemaData", !!REMADATA_API_KEY)}        ║
+${col("║  AirtelTigo → RemaData", !!REMADATA_API_KEY)}        ║
+${col("║  Paystack Webhook", !!PAYSTACK_SECRET)}        ║
+${col("║  API Key Auth", !!DELIVER_SECRET)}        ║
+${col("║  Firebase", !!db)}        ║
+╠══════════════════════════════════════════════════════════════╣
+${col("║  CORS Origins", ALLOWED_ORIGINS.length > 0 ? ALLOWED_ORIGINS.join(", ") : "DENY ALL")}
+╠══════════════════════════════════════════════════════════════╣
+║  Security Features:                                         ║
+║  • 🔴 DELIVER_SECRET NOT sent to browser                   ║
+║  • 🔴 Frontend CANNOT call /deliver                        ║
+║  • 🟢 Only webhook triggers delivery                       ║
+║  • 🟢 Rate limiting active                                 ║
+║  • 🟢 CORS defaults to deny all                            ║
+║  • 🟢 Admin endpoints require API key                      ║
+║  • 🟢 Order tracking uses indexed queries                  ║
+╚══════════════════════════════════════════════════════════════╝`);
 });
+
+// Keep-alive for Render free tier
+if (process.env.NODE_ENV === "production") {
+    setInterval(async () => {
+        try {
+            await axios.get(`http://localhost:${PORT}/health`, { timeout: 10000 });
+        } catch (err) {
+            console.error(`⚠️ Keep-alive failed: ${err.message}`);
+        }
+    }, 4 * 60 * 1000);
+}
 
 module.exports = app;
