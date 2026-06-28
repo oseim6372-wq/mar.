@@ -1,7 +1,7 @@
 // ============================================================
-//  DATEFLOW GH — UNIFIED BACKEND (REMA DATA INTEGRATION)
-//  MTN/Telecel/AT → RemaData API
-//  Features: Retry logic, queue, memory protection, frontend serving
+//  DATEFLOW GH — UNIFIED BACKEND (PRODUCTION READY)
+//  MTN/Telecel/AT → RemaData API (local format 0XXXXXXXXX + volume mapping)
+//  Features: Retry logic, queue, memory protection, config injection
 // ============================================================
 
 require("dotenv").config();
@@ -10,6 +10,8 @@ const axios = require("axios");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const crypto = require("crypto");
+const path = require("path");
+const fs = require("fs");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -24,6 +26,10 @@ const REMADATA_API_KEY = process.env.REMADATA_API_KEY || "";
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY || "";
 const DELIVER_SECRET = process.env.DELIVER_SECRET || "";
 
+// Backend URL for config injection
+const BACKEND_URL = process.env.BACKEND_URL || "https://dataflow-backend-3fls.onrender.com";
+const PAYSTACK_PUBLIC_KEY = process.env.PAYSTACK_PUBLIC_KEY || "pk_live_ca0cb6cd18a148e6f9a915b4f8bd18be85d335b0";
+
 // Retry configuration
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
@@ -37,7 +43,7 @@ const MAX_REF_SIZE = 10000;
 const failedSaveQueue = [];
 let isProcessingQueue = false;
 
-// Network providers
+// Network providers - all via RemaData
 const NETWORK_PROVIDER = {
   mtn: { name: "RemaData", primary: true },
   telecel: { name: "RemaData", primary: true },
@@ -65,52 +71,52 @@ const REMA_MB_MAP = {
 };
 
 // ─────────────────────────────────────────────
-//  FALLBACK BUNDLE DATA (If RemaData API fails)
+//  BUNDLE DATA (FALLBACK IF API FAILS)
 // ─────────────────────────────────────────────
 
-const FALLBACK_BUNDLE_DATA = {
+const BUNDLE_DATA = {
   mtn: [
-    { volumeInMB: 1024, volume: "1GB", price: 5.00, name: "1GB", network: "mtn" },
-    { volumeInMB: 2048, volume: "2GB", price: 9.40, name: "2GB", network: "mtn" },
-    { volumeInMB: 3072, volume: "3GB", price: 13.40, name: "3GB", network: "mtn" },
-    { volumeInMB: 4096, volume: "4GB", price: 17.70, name: "4GB", network: "mtn" },
-    { volumeInMB: 5120, volume: "5GB", price: 22.50, name: "5GB", network: "mtn" },
-    { volumeInMB: 6144, volume: "6GB", price: 26.30, name: "6GB", network: "mtn" },
-    { volumeInMB: 10240, volume: "10GB", price: 43.20, name: "10GB", network: "mtn" },
-    { volumeInMB: 15360, volume: "15GB", price: 63.20, name: "15GB", network: "mtn" },
-    { volumeInMB: 20480, volume: "20GB", price: 82.70, name: "20GB", network: "mtn" },
-    { volumeInMB: 25600, volume: "25GB", price: 105.20, name: "25GB", network: "mtn" },
-    { volumeInMB: 30720, volume: "30GB", price: 126.70, name: "30GB", network: "mtn" },
-    { volumeInMB: 40960, volume: "40GB", price: 171.70, name: "40GB", network: "mtn" },
-    { volumeInMB: 51200, volume: "50GB", price: 202.70, name: "50GB", network: "mtn" },
-    { volumeInMB: 102400, volume: "100GB", price: 437.70, name: "100GB", network: "mtn" },
+    { volumeInMB: 1024, price: 5.00, name: "1GB" },
+    { volumeInMB: 2048, price: 9.40, name: "2GB" },
+    { volumeInMB: 3072, price: 13.40, name: "3GB" },
+    { volumeInMB: 4096, price: 17.70, name: "4GB" },
+    { volumeInMB: 5120, price: 22.50, name: "5GB" },
+    { volumeInMB: 6144, price: 26.30, name: "6GB" },
+    { volumeInMB: 10240, price: 43.20, name: "10GB" },
+    { volumeInMB: 15360, price: 63.20, name: "15GB" },
+    { volumeInMB: 20480, price: 82.70, name: "20GB" },
+    { volumeInMB: 25600, price: 105.20, name: "25GB" },
+    { volumeInMB: 30720, price: 126.70, name: "30GB" },
+    { volumeInMB: 40960, price: 171.70, name: "40GB" },
+    { volumeInMB: 51200, price: 202.70, name: "50GB" },
+    { volumeInMB: 102400, price: 437.70, name: "100GB" }
   ],
   telecel: [
-    { volumeInMB: 10240, volume: "10GB", price: 38.00, name: "10GB", network: "telecel" },
-    { volumeInMB: 15360, volume: "15GB", price: 55.00, name: "15GB", network: "telecel" },
-    { volumeInMB: 20480, volume: "20GB", price: 74.00, name: "20GB", network: "telecel" },
-    { volumeInMB: 25600, volume: "25GB", price: 92.00, name: "25GB", network: "telecel" },
-    { volumeInMB: 30720, volume: "30GB", price: 109.00, name: "30GB", network: "telecel" },
-    { volumeInMB: 40960, volume: "40GB", price: 143.00, name: "40GB", network: "telecel" },
-    { volumeInMB: 51200, volume: "50GB", price: 177.00, name: "50GB", network: "telecel" },
-    { volumeInMB: 102400, volume: "100GB", price: 354.00, name: "100GB", network: "telecel" },
+    { volumeInMB: 10240, price: 38.00, name: "10GB" },
+    { volumeInMB: 15360, price: 55.00, name: "15GB" },
+    { volumeInMB: 20480, price: 74.00, name: "20GB" },
+    { volumeInMB: 25600, price: 92.00, name: "25GB" },
+    { volumeInMB: 30720, price: 109.00, name: "30GB" },
+    { volumeInMB: 40960, price: 143.00, name: "40GB" },
+    { volumeInMB: 51200, price: 177.00, name: "50GB" },
+    { volumeInMB: 102400, price: 354.00, name: "100GB" }
   ],
   airteltigo: [
-    { volumeInMB: 1024, volume: "1GB", price: 3.90, name: "1GB", network: "airteltigo" },
-    { volumeInMB: 2048, volume: "2GB", price: 7.80, name: "2GB", network: "airteltigo" },
-    { volumeInMB: 3072, volume: "3GB", price: 11.80, name: "3GB", network: "airteltigo" },
-    { volumeInMB: 4096, volume: "4GB", price: 15.70, name: "4GB", network: "airteltigo" },
-    { volumeInMB: 5120, volume: "5GB", price: 19.40, name: "5GB", network: "airteltigo" },
-    { volumeInMB: 6144, volume: "6GB", price: 23.80, name: "6GB", network: "airteltigo" },
-    { volumeInMB: 7168, volume: "7GB", price: 27.40, name: "7GB", network: "airteltigo" },
-    { volumeInMB: 8192, volume: "8GB", price: 31.00, name: "8GB", network: "airteltigo" },
-    { volumeInMB: 9216, volume: "9GB", price: 35.00, name: "9GB", network: "airteltigo" },
-    { volumeInMB: 10240, volume: "10GB", price: 39.00, name: "10GB", network: "airteltigo" },
-    { volumeInMB: 12288, volume: "12GB", price: 47.00, name: "12GB", network: "airteltigo" },
-    { volumeInMB: 15360, volume: "15GB", price: 59.00, name: "15GB", network: "airteltigo" },
-    { volumeInMB: 20480, volume: "20GB", price: 78.50, name: "20GB", network: "airteltigo" },
-    { volumeInMB: 25600, volume: "25GB", price: 98.00, name: "25GB", network: "airteltigo" },
-  ],
+    { volumeInMB: 1024, price: 3.90, name: "1GB" },
+    { volumeInMB: 2048, price: 7.80, name: "2GB" },
+    { volumeInMB: 3072, price: 11.80, name: "3GB" },
+    { volumeInMB: 4096, price: 15.70, name: "4GB" },
+    { volumeInMB: 5120, price: 19.40, name: "5GB" },
+    { volumeInMB: 6144, price: 23.80, name: "6GB" },
+    { volumeInMB: 7168, price: 27.40, name: "7GB" },
+    { volumeInMB: 8192, price: 31.00, name: "8GB" },
+    { volumeInMB: 9216, price: 35.00, name: "9GB" },
+    { volumeInMB: 10240, price: 39.00, name: "10GB" },
+    { volumeInMB: 12288, price: 47.00, name: "12GB" },
+    { volumeInMB: 15360, price: 59.00, name: "15GB" },
+    { volumeInMB: 20480, price: 78.50, name: "20GB" },
+    { volumeInMB: 25600, price: 98.00, name: "25GB" }
+  ]
 };
 
 // ─────────────────────────────────────────────
@@ -181,6 +187,7 @@ function validateEnv() {
     ["DELIVER_SECRET", DELIVER_SECRET, "/deliver endpoint unprotected"],
     ["FIREBASE_DATABASE_URL", process.env.FIREBASE_DATABASE_URL, "Orders will not be saved"],
     ["FIREBASE_SERVICE_ACCOUNT_JSON", process.env.FIREBASE_SERVICE_ACCOUNT_JSON, "Firebase disabled"],
+    ["BACKEND_URL", process.env.BACKEND_URL, "Frontend config injection will use default"],
   ];
 
   const missing = checks.filter(([, val]) => !val);
@@ -190,6 +197,8 @@ function validateEnv() {
       console.warn(`   • ${key.padEnd(36)} → ${impact}`)
     );
   }
+  
+  console.log(`✅ Backend URL configured: ${BACKEND_URL}`);
 }
 
 // ─────────────────────────────────────────────
@@ -372,6 +381,72 @@ function requireApiKey(req, res, next) {
 }
 
 // ─────────────────────────────────────────────
+//  SERVE FRONTEND WITH CONFIG INJECTION ⭐
+// ─────────────────────────────────────────────
+
+// Serve static files from public folder
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Main route - inject config into HTML
+app.get('/', (req, res) => {
+    try {
+        const indexPath = path.join(__dirname, 'public', 'index.html');
+        
+        // Check if file exists
+        if (!fs.existsSync(indexPath)) {
+            console.warn('⚠️ index.html not found in public folder');
+            return res.send(`
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>DataFlow GH</title>
+                    <style>
+                        body { font-family: Arial; background: #06060A; color: #E8E8F0; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; text-align: center; }
+                        h1 { color: #FFCC00; font-size: 3rem; }
+                        p { color: #5A5A78; }
+                        .info { background: #13131C; border: 1px solid #1E1E2E; border-radius: 18px; padding: 2rem; margin-top: 1rem; }
+                    </style>
+                </head>
+                <body>
+                    <div>
+                        <h1>🚀 DataFlow GH</h1>
+                        <p>Server is running! Please upload index.html to the public folder.</p>
+                        <div class="info">
+                            <p>📡 Backend URL: ${BACKEND_URL}</p>
+                            <p>🔧 Status: Online</p>
+                        </div>
+                    </div>
+                </body>
+                </html>
+            `);
+        }
+        
+        let html = fs.readFileSync(indexPath, 'utf8');
+        
+        // ⭐ INJECT THE CONFIG HERE ⭐
+        const injectScript = `
+        <script>
+          window.__DF_CONFIG = {
+            paystackKey: "${PAYSTACK_PUBLIC_KEY}",
+            backendUrl: "${BACKEND_URL}"
+          };
+          console.log('🔒 Config injected from server');
+          console.log('📡 Backend URL:', window.__DF_CONFIG.backendUrl);
+        </script>
+        `;
+        
+        // Insert the config before closing head tag
+        html = html.replace('</head>', injectScript + '</head>');
+        
+        res.send(html);
+        
+    } catch (err) {
+        console.error('❌ Error serving index:', err);
+        res.status(500).send('Error loading page');
+    }
+});
+
+// ─────────────────────────────────────────────
 //  PHONE FORMATTING HELPERS
 // ─────────────────────────────────────────────
 
@@ -389,6 +464,11 @@ function formatPhoneLocal(phone) {
     );
   }
   return p;
+}
+
+function resolveVolume(volumeInMB) {
+  const mb = Number(volumeInMB);
+  return mb >= 1024 ? String(Math.round(mb / 1024)) : String(mb);
 }
 
 // ─────────────────────────────────────────────
@@ -620,6 +700,7 @@ app.get("/health", (req, res) => {
     firebaseQueueSize: failedSaveQueue.length,
     webhook: !!PAYSTACK_SECRET,
     memory: { processedRefsSize: processedRefs.size },
+    backendUrl: BACKEND_URL,
   });
 });
 
@@ -639,27 +720,22 @@ app.get("/api/balance", asyncHandler(async (req, res) => {
 }));
 
 // ─────────────────────────────────────────────
-//  BUNDLES API - Fetches from RemaData with Fallback
+//  BUNDLES API
 // ─────────────────────────────────────────────
 
 app.get("/api/bundles", asyncHandler(async (req, res) => {
   const network = (req.query.network || "mtn").toLowerCase();
-  
-  console.log(`📡 Fetching bundles for: ${network}`);
 
-  // Try to fetch from RemaData API first
+  // Try to fetch from RemaData first
   if (REMADATA_API_KEY) {
     try {
-      console.log(`🔄 Attempting to fetch from RemaData API...`);
-      
+      console.log(`📡 Fetching bundles from RemaData for: ${network}`);
       const response = await axios.get(`${REMADATA_API_URL}/bundles?network=${network}`, {
         headers: { "X-API-KEY": REMADATA_API_KEY },
         timeout: 10000,
       });
       
       if (response.data?.status === "success" && response.data?.data?.length > 0) {
-        console.log(`✅ Fetched ${response.data.data.length} bundles from RemaData`);
-        
         let bundles = response.data.data;
         const settings = await getProfitSettings();
         
@@ -687,11 +763,11 @@ app.get("/api/bundles", asyncHandler(async (req, res) => {
   }
 
   // Fallback to local bundle data
-  if (!FALLBACK_BUNDLE_DATA[network]) {
+  if (!BUNDLE_DATA[network]) {
     throw new AppError(`Unknown network "${network}"`, 400, "VALIDATION");
   }
 
-  let bundles = FALLBACK_BUNDLE_DATA[network];
+  let bundles = BUNDLE_DATA[network];
   console.log(`📦 Using fallback data: ${bundles.length} bundles for ${network}`);
 
   const settings = await getProfitSettings();
@@ -748,7 +824,21 @@ app.get("/api/order-status/:reference", asyncHandler(async (req, res) => {
     throw new AppError("Reference parameter is required", 400, "VALIDATION");
   }
 
-  // Check RemaData for status
+  // Check Firebase first
+  if (db) {
+    try {
+      const snapshot = await db.ref('orders').orderByChild('orderId').equalTo(reference).once('value');
+      const data = snapshot.val();
+      if (data) {
+        const order = Object.values(data)[0];
+        return res.json({ status: "success", source: "firebase", order: order });
+      }
+    } catch (err) {
+      console.warn('Firebase lookup error:', err.message);
+    }
+  }
+
+  // Check RemaData
   if (!REMADATA_API_KEY) {
     throw new AppError("RemaData API not configured", 503, "CONFIGURATION");
   }
@@ -814,64 +904,6 @@ app.post("/api/profit-settings", asyncHandler(async (req, res) => {
 
   res.json({ status: "success", settings });
 }));
-
-// ─────────────────────────────────────────────
-//  SERVE FRONTEND - TEMPORARY TEST PAGE
-// ─────────────────────────────────────────────
-
-// Serve a simple page that fetches and displays bundles
-app.get("/frontend", (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>DataFlow GH - Test</title>
-      <style>
-        body { font-family: Arial; background: #06060A; color: #E8E8F0; padding: 2rem; }
-        h1 { color: #FFCC00; }
-        .bundles { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; margin-top: 2rem; }
-        .bundle { background: #13131C; border: 1px solid #1E1E2E; border-radius: 12px; padding: 1.5rem; }
-        .bundle .name { font-size: 1.5rem; font-weight: bold; color: #FFCC00; }
-        .bundle .price { color: #00D98B; font-size: 1.2rem; }
-        .bundle .network { color: #5A5A78; font-size: 0.8rem; }
-        .loading { text-align: center; padding: 2rem; color: #5A5A78; }
-        .error { color: #FF4455; text-align: center; padding: 2rem; }
-      </style>
-    </head>
-    <body>
-      <h1>🚀 DataFlow GH - Bundle Test</h1>
-      <p>Loading bundles from your API...</p>
-      <div id="bundles" class="bundles"><div class="loading">⏳ Loading...</div></div>
-      
-      <script>
-        async function loadBundles() {
-          try {
-            const response = await fetch('/api/bundles?network=mtn');
-            const data = await response.json();
-            const container = document.getElementById('bundles');
-            
-            if (data.status === 'success' && data.data && data.data.length) {
-              container.innerHTML = data.data.map(b => \`
-                <div class="bundle">
-                  <div class="name">\${b.name || b.volume}</div>
-                  <div class="price">GH₵ \${b.price.toFixed(2)}</div>
-                  <div class="network">\${b.network || 'MTN'} · \${b.volumeInMB}MB</div>
-                </div>
-              \`).join('');
-              console.log('✅ Loaded', data.data.length, 'bundles');
-            } else {
-              container.innerHTML = '<div class="error">❌ No bundles found</div>';
-            }
-          } catch (err) {
-            document.getElementById('bundles').innerHTML = '<div class="error">❌ Error loading bundles: ' + err.message + '</div>';
-          }
-        }
-        loadBundles();
-      </script>
-    </body>
-    </html>
-  `);
-});
 
 // ─────────────────────────────────────────────
 //  404 HANDLER
@@ -948,9 +980,8 @@ ${col("║  Paystack Webhook", !!PAYSTACK_SECRET)}        ║
 ${col("║  /deliver Auth", !!DELIVER_SECRET)}        ║
 ${col("║  Firebase", !!db)}        ║
 ╠══════════════════════════════════════════════════════════════╣
-${col("║  Fallback Bundles - MTN", FALLBACK_BUNDLE_DATA.mtn.length)}        ║
-${col("║  Fallback Bundles - Telecel", FALLBACK_BUNDLE_DATA.telecel.length)}        ║
-${col("║  Fallback Bundles - AT", FALLBACK_BUNDLE_DATA.airteltigo.length)}        ║
+${col("║  Backend URL", BACKEND_URL)}        ║
+${col("║  Config Injection", "ACTIVE ✅")}        ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Features:                                                  ║
 ║  • Retry logic (${MAX_RETRIES}x exponential backoff)                   ║
@@ -958,8 +989,7 @@ ${col("║  Fallback Bundles - AT", FALLBACK_BUNDLE_DATA.airteltigo.length)}    
 ║  • Memory protection (${MAX_REF_SIZE} max refs)                        ║
 ║  • Firebase queue (${failedSaveQueue.length} pending)                    ║
 ║  • Customer-friendly error messages                        ║
-║  • RemaData API integration with fallback                  ║
-║  • Test frontend at /frontend                              ║
+║  • ✅ Config injection for frontend                         ║
 ╚══════════════════════════════════════════════════════════════╝`);
 });
 
