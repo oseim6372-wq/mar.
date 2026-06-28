@@ -1,7 +1,8 @@
 // ============================================================
-//  DATEFLOW GH — UNIFIED BACKEND (PRODUCTION READY)
-//  MTN/Telecel/AT → RemaData API (local format 0XXXXXXXXX + volume mapping)
-//  Features: Retry logic, queue, memory protection, config injection
+//  DATEFLOW GH — SECURE BACKEND (PRODUCTION READY)
+//  MTN/Telecel/AT → RemaData API
+//  CORS: Only allows your domain
+//  Features: Retry logic, queue, memory protection
 // ============================================================
 
 require("dotenv").config();
@@ -30,7 +31,93 @@ const DELIVER_SECRET = process.env.DELIVER_SECRET || "";
 const BACKEND_URL = process.env.BACKEND_URL || "https://dataflow-backend-3fls.onrender.com";
 const PAYSTACK_PUBLIC_KEY = process.env.PAYSTACK_PUBLIC_KEY || "pk_live_ca0cb6cd18a148e6f9a915b4f8bd18be85d335b0";
 
-// Retry configuration
+// ─────────────────────────────────────────────
+//  🔒 SECURE CORS - ONLY ALLOW YOUR DOMAIN
+// ─────────────────────────────────────────────
+
+// List of allowed origins (frontend domains)
+const ALLOWED_ORIGINS = [
+    'https://dataflow.kesug.com',  // Your frontend domain
+    'http://localhost:3000',        // Local development
+    'http://localhost:5500',        // Local development (Live Server)
+];
+
+// Add any additional domains from environment variable
+const extraOrigins = (process.env.ALLOWED_ORIGINS || "").split(",").filter(Boolean);
+ALLOWED_ORIGINS.push(...extraOrigins);
+
+console.log('🔒 CORS Allowed Origins:', ALLOWED_ORIGINS);
+
+const corsOptions = {
+    origin: function(origin, callback) {
+        // Allow requests with no origin (like mobile apps, curl, server-to-server)
+        if (!origin) {
+            return callback(null, true);
+        }
+        
+        // Check if origin is allowed
+        if (ALLOWED_ORIGINS.indexOf(origin) !== -1) {
+            callback(null, true);
+        } else {
+            console.warn(`🚫 CORS blocked request from: ${origin}`);
+            callback(new Error(`Origin ${origin} not allowed by CORS`));
+        }
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'X-API-Key'],
+    credentials: true,
+    maxAge: 86400 // 24 hours
+};
+
+// Use secure CORS
+app.use(cors(corsOptions));
+
+// ─────────────────────────────────────────────
+//  MIDDLEWARE
+// ─────────────────────────────────────────────
+
+// Raw body capture for Paystack webhook
+app.use((req, res, next) => {
+  if (req.path === "/paystack/webhook") {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      req.rawBody = Buffer.concat(chunks);
+      try {
+        req.body = JSON.parse(req.rawBody.toString());
+      } catch {
+        req.body = {};
+      }
+      next();
+    });
+    req.on("error", next);
+  } else {
+    express.json()(req, res, next);
+  }
+});
+
+// Request timeout
+app.use((req, res, next) => {
+  req.setTimeout(30000);
+  res.setTimeout(30000);
+  next();
+});
+
+// Request logger
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    const ms = Date.now() - start;
+    const icon = res.statusCode < 400 ? "✓" : res.statusCode < 500 ? "⚠" : "✗";
+    console.log(`${icon} ${req.method} ${req.path} → ${res.statusCode} (${ms}ms)`);
+  });
+  next();
+});
+
+// ─────────────────────────────────────────────
+//  RETRY CONFIGURATION
+// ─────────────────────────────────────────────
+
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
 
@@ -71,7 +158,7 @@ const REMA_MB_MAP = {
 };
 
 // ─────────────────────────────────────────────
-//  BUNDLE DATA (FALLBACK IF API FAILS)
+//  FALLBACK BUNDLE DATA
 // ─────────────────────────────────────────────
 
 const BUNDLE_DATA = {
@@ -199,6 +286,7 @@ function validateEnv() {
   }
   
   console.log(`✅ Backend URL configured: ${BACKEND_URL}`);
+  console.log(`🔒 CORS Allowed Origins: ${ALLOWED_ORIGINS.join(', ')}`);
 }
 
 // ─────────────────────────────────────────────
@@ -321,50 +409,6 @@ setInterval(() => {
 }, 60 * 60 * 1000);
 
 // ─────────────────────────────────────────────
-//  MIDDLEWARE
-// ─────────────────────────────────────────────
-
-app.use(cors({ origin: "*" }));
-
-// Raw body capture for Paystack webhook
-app.use((req, res, next) => {
-  if (req.path === "/paystack/webhook") {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => {
-      req.rawBody = Buffer.concat(chunks);
-      try {
-        req.body = JSON.parse(req.rawBody.toString());
-      } catch {
-        req.body = {};
-      }
-      next();
-    });
-    req.on("error", next);
-  } else {
-    express.json()(req, res, next);
-  }
-});
-
-// Request timeout
-app.use((req, res, next) => {
-  req.setTimeout(30000);
-  res.setTimeout(30000);
-  next();
-});
-
-// Request logger
-app.use((req, res, next) => {
-  const start = Date.now();
-  res.on("finish", () => {
-    const ms = Date.now() - start;
-    const icon = res.statusCode < 400 ? "✓" : res.statusCode < 500 ? "⚠" : "✗";
-    console.log(`${icon} ${req.method} ${req.path} → ${res.statusCode} (${ms}ms)`);
-  });
-  next();
-});
-
-// ─────────────────────────────────────────────
 //  AUTH MIDDLEWARE
 // ─────────────────────────────────────────────
 
@@ -381,7 +425,7 @@ function requireApiKey(req, res, next) {
 }
 
 // ─────────────────────────────────────────────
-//  SERVE FRONTEND WITH CONFIG INJECTION ⭐
+//  SERVE FRONTEND WITH CONFIG INJECTION
 // ─────────────────────────────────────────────
 
 // Serve static files from public folder
@@ -392,7 +436,6 @@ app.get('/', (req, res) => {
     try {
         const indexPath = path.join(__dirname, 'public', 'index.html');
         
-        // Check if file exists
         if (!fs.existsSync(indexPath)) {
             console.warn('⚠️ index.html not found in public folder');
             return res.send(`
@@ -405,6 +448,7 @@ app.get('/', (req, res) => {
                         h1 { color: #FFCC00; font-size: 3rem; }
                         p { color: #5A5A78; }
                         .info { background: #13131C; border: 1px solid #1E1E2E; border-radius: 18px; padding: 2rem; margin-top: 1rem; }
+                        .allowed { color: #00D98B; }
                     </style>
                 </head>
                 <body>
@@ -413,6 +457,7 @@ app.get('/', (req, res) => {
                         <p>Server is running! Please upload index.html to the public folder.</p>
                         <div class="info">
                             <p>📡 Backend URL: ${BACKEND_URL}</p>
+                            <p>🔒 CORS: <span class="allowed">${ALLOWED_ORIGINS.join(', ')}</span></p>
                             <p>🔧 Status: Online</p>
                         </div>
                     </div>
@@ -423,7 +468,7 @@ app.get('/', (req, res) => {
         
         let html = fs.readFileSync(indexPath, 'utf8');
         
-        // ⭐ INJECT THE CONFIG HERE ⭐
+        // Inject the config
         const injectScript = `
         <script>
           window.__DF_CONFIG = {
@@ -435,9 +480,7 @@ app.get('/', (req, res) => {
         </script>
         `;
         
-        // Insert the config before closing head tag
         html = html.replace('</head>', injectScript + '</head>');
-        
         res.send(html);
         
     } catch (err) {
@@ -701,6 +744,7 @@ app.get("/health", (req, res) => {
     webhook: !!PAYSTACK_SECRET,
     memory: { processedRefsSize: processedRefs.size },
     backendUrl: BACKEND_URL,
+    cors: ALLOWED_ORIGINS,
   });
 });
 
@@ -970,7 +1014,7 @@ app.listen(PORT, () => {
   const col = (label, ok) => `  ${label.padEnd(28)} ${ok ? "✅" : "❌"}`;
   console.log(`
 ╔══════════════════════════════════════════════════════════════╗
-║   🚀  DataFlow GH Backend — Production Ready                 ║
+║   🚀  DataFlow GH Backend — SECURE Production               ║
 ║   📡  Port: ${String(PORT).padEnd(37)}║
 ╠══════════════════════════════════════════════════════════════╣
 ${col("║  MTN → RemaData", !!REMADATA_API_KEY)}        ║
@@ -981,15 +1025,16 @@ ${col("║  /deliver Auth", !!DELIVER_SECRET)}        ║
 ${col("║  Firebase", !!db)}        ║
 ╠══════════════════════════════════════════════════════════════╣
 ${col("║  Backend URL", BACKEND_URL)}        ║
-${col("║  Config Injection", "ACTIVE ✅")}        ║
+${col("║  CORS Allowed Origins", ALLOWED_ORIGINS.join(', '))}        ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Features:                                                  ║
-║  • Retry logic (${MAX_RETRIES}x exponential backoff)                   ║
-║  • All networks via RemaData                               ║
-║  • Memory protection (${MAX_REF_SIZE} max refs)                        ║
-║  • Firebase queue (${failedSaveQueue.length} pending)                    ║
-║  • Customer-friendly error messages                        ║
-║  • ✅ Config injection for frontend                         ║
+║  Security Features:                                          ║
+║  • 🔒 CORS restricts access to your domain only             ║
+║  • 🔐 DELIVER_SECRET never sent to browser                  ║
+║  • ✅ Webhook-only delivery (no frontend /deliver)          ║
+║  • 🔄 Retry logic (${MAX_RETRIES}x exponential backoff)                   ║
+║  • 🛡️  Memory protection (${MAX_REF_SIZE} max refs)                        ║
+║  • 📦 Firebase queue (${failedSaveQueue.length} pending)                    ║
+║  • ⚡ Config injection for frontend                         ║
 ╚══════════════════════════════════════════════════════════════╝`);
 });
 
