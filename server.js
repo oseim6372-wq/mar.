@@ -38,6 +38,7 @@ const PAYSTACK_PUBLIC_KEY = process.env.PAYSTACK_PUBLIC_KEY || "pk_live_ca0cb6cd
 // List of allowed origins (frontend domains)
 const ALLOWED_ORIGINS = [
     'http://dataflow.kesug.com',  // Your frontend domain
+    'https://dataflow.kesug.com',
     'http://localhost:3000',        // Local development
     'http://localhost:5500',        // Local development (Live Server)
 ];
