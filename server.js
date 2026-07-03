@@ -32,6 +32,13 @@ const BACKEND_URL = process.env.BACKEND_URL || "https://dataflow-backend-3fls.on
 const PAYSTACK_PUBLIC_KEY = process.env.PAYSTACK_PUBLIC_KEY || "pk_live_ca0cb6cd18a148e6f9a915b4f8bd18be85d335b0";
 
 // ─────────────────────────────────────────────
+//  PAYSTACK FEE CONFIGURATION
+// ─────────────────────────────────────────────
+
+const PAYSTACK_FEE_PERCENTAGE = 1.5; // 1.5% Paystack fee
+const PAYSTACK_FIXED_FEE = 0.50;     // ₵0.50 fixed fee per transaction
+
+// ─────────────────────────────────────────────
 //  🔒 SECURE CORS - ONLY ALLOW YOUR DOMAIN
 // ─────────────────────────────────────────────
 
@@ -180,30 +187,31 @@ const BUNDLE_DATA = {
     { volumeInMB: 102400, price: 437.70, name: "100GB" }
   ],
   telecel: [
-    { volumeInMB: 10240, price: 38.00, name: "10GB" },
-    { volumeInMB: 15360, price: 55.00, name: "15GB" },
-    { volumeInMB: 20480, price: 74.00, name: "20GB" },
-    { volumeInMB: 25600, price: 92.00, name: "25GB" },
-    { volumeInMB: 30720, price: 109.00, name: "30GB" },
-    { volumeInMB: 40960, price: 143.00, name: "40GB" },
-    { volumeInMB: 51200, price: 177.00, name: "50GB" },
-    { volumeInMB: 102400, price: 354.00, name: "100GB" }
+    { volumeInMB: 5120, price: 19.00, name: "5GB" },
+    { volumeInMB: 10240, price: 36.00, name: "10GB" },
+    { volumeInMB: 15360, price: 53.00, name: "15GB" },
+    { volumeInMB: 20480, price: 70.40, name: "20GB" },
+    { volumeInMB: 25600, price: 85.60, name: "25GB" },
+    { volumeInMB: 30720, price: 105.60, name: "30GB" },
+    { volumeInMB: 40960, price: 139.50, name: "40GB" },
+    { volumeInMB: 51200, price: 173.60, name: "50GB" },
+    { volumeInMB: 102400, price: 345.00, name: "100GB" }
   ],
   airteltigo: [
-    { volumeInMB: 1024, price: 3.90, name: "1GB" },
-    { volumeInMB: 2048, price: 7.80, name: "2GB" },
-    { volumeInMB: 3072, price: 11.80, name: "3GB" },
-    { volumeInMB: 4096, price: 15.70, name: "4GB" },
-    { volumeInMB: 5120, price: 19.40, name: "5GB" },
-    { volumeInMB: 6144, price: 23.80, name: "6GB" },
-    { volumeInMB: 7168, price: 27.40, name: "7GB" },
-    { volumeInMB: 8192, price: 31.00, name: "8GB" },
-    { volumeInMB: 9216, price: 35.00, name: "9GB" },
-    { volumeInMB: 10240, price: 39.00, name: "10GB" },
-    { volumeInMB: 12288, price: 47.00, name: "12GB" },
-    { volumeInMB: 15360, price: 59.00, name: "15GB" },
-    { volumeInMB: 20480, price: 78.50, name: "20GB" },
-    { volumeInMB: 25600, price: 98.00, name: "25GB" }
+    { volumeInMB: 1024, price: 4.20, name: "1GB" },
+    { volumeInMB: 2048, price: 8.00, name: "2GB" },
+    { volumeInMB: 3072, price: 12.59, name: "3GB" },
+    { volumeInMB: 4096, price: 15.80, name: "4GB" },
+    { volumeInMB: 5120, price: 16.71, name: "5GB" },
+    { volumeInMB: 6144, price: 23.00, name: "6GB" },
+    { volumeInMB: 7168, price: 27.00, name: "7GB" },
+    { volumeInMB: 8192, price: 30.20, name: "8GB" },
+    { volumeInMB: 10240, price: 38.50, name: "10GB" },
+    { volumeInMB: 12288, price: 47.50, name: "12GB" },
+    { volumeInMB: 15360, price: 58.40, name: "15GB" },
+    { volumeInMB: 20480, price: 77.80, name: "20GB" },
+    { volumeInMB: 25600, price: 98.50, name: "25GB" },
+    { volumeInMB: 30720, price: 115.50, name: "30GB" }
   ]
 };
 
@@ -288,6 +296,7 @@ function validateEnv() {
   
   console.log(`✅ Backend URL configured: ${BACKEND_URL}`);
   console.log(`🔒 CORS Allowed Origins: ${ALLOWED_ORIGINS.join(', ')}`);
+  console.log(`💰 Paystack fee: ${PAYSTACK_FEE_PERCENTAGE}% + ₵${PAYSTACK_FIXED_FEE.toFixed(2)}`);
 }
 
 // ─────────────────────────────────────────────
@@ -553,17 +562,29 @@ function applyProfit(costPrice, volumeInMB, network, settings) {
   if (!settings) return costPrice;
   const { mode, flatAmount = 0, percentAmount = 0, perBundle = {} } = settings;
   
+  let basePrice = costPrice;
+  
+  // Apply profit margin first
   if (mode === "percent") {
     const pct = parseFloat(percentAmount) || 0;
-    return Math.ceil(costPrice * (1 + pct / 100) * 20) / 20;
-  }
-  if (mode === "perBundle") {
+    basePrice = Math.ceil(costPrice * (1 + pct / 100) * 20) / 20;
+  } else if (mode === "perBundle") {
     const key = `${network}_${volumeInMB}`;
     const bundleProfit = parseFloat(perBundle?.[key]) || parseFloat(flatAmount) || 0;
-    return Math.ceil((costPrice + bundleProfit) * 20) / 20;
+    basePrice = Math.ceil((costPrice + bundleProfit) * 20) / 20;
+  } else {
+    const flat = parseFloat(flatAmount) || 0;
+    basePrice = Math.ceil((costPrice + flat) * 20) / 20;
   }
-  const flat = parseFloat(flatAmount) || 0;
-  return Math.ceil((costPrice + flat) * 20) / 20;
+  
+  // 🔥 Add Paystack fees on top
+  // Paystack charges: 1.5% + ₵0.50 per transaction
+  const paystackFee = Math.ceil((basePrice * (PAYSTACK_FEE_PERCENTAGE / 100) + PAYSTACK_FIXED_FEE) * 20) / 20;
+  const finalPrice = Math.ceil((basePrice + paystackFee) * 20) / 20;
+  
+  console.log(`💰 Fee breakdown: cost=${costPrice}, base=${basePrice}, fee=${paystackFee}, final=${finalPrice}`);
+  
+  return finalPrice;
 }
 
 // ─────────────────────────────────────────────
@@ -746,6 +767,11 @@ app.get("/health", (req, res) => {
     memory: { processedRefsSize: processedRefs.size },
     backendUrl: BACKEND_URL,
     cors: ALLOWED_ORIGINS,
+    paystackFee: {
+      percentage: PAYSTACK_FEE_PERCENTAGE,
+      fixedFee: PAYSTACK_FIXED_FEE,
+      formula: `${PAYSTACK_FEE_PERCENTAGE}% + ₵${PAYSTACK_FIXED_FEE.toFixed(2)}`
+    }
   });
 });
 
@@ -763,6 +789,23 @@ app.get("/api/balance", asyncHandler(async (req, res) => {
     throw new AppError(`Failed to fetch balance: ${err.message}`, 502, "PROVIDER");
   }
 }));
+
+// ─────────────────────────────────────────────
+//  PAYSTACK FEE ENDPOINT
+// ─────────────────────────────────────────────
+
+app.get("/api/paystack-fee", (req, res) => {
+  res.json({
+    status: "success",
+    percentage: PAYSTACK_FEE_PERCENTAGE,
+    fixedFee: PAYSTACK_FIXED_FEE,
+    formula: `${PAYSTACK_FEE_PERCENTAGE}% + ₵${PAYSTACK_FIXED_FEE.toFixed(2)} per transaction`,
+    example: {
+      description: "For a ₵100 transaction, the Paystack fee would be:",
+      calculation: `(${PAYSTACK_FEE_PERCENTAGE}% × ₵100) + ₵${PAYSTACK_FIXED_FEE.toFixed(2)} = ₵${(100 * PAYSTACK_FEE_PERCENTAGE / 100 + PAYSTACK_FIXED_FEE).toFixed(2)}`
+    }
+  });
+});
 
 // ─────────────────────────────────────────────
 //  BUNDLES API
@@ -787,18 +830,26 @@ app.get("/api/bundles", asyncHandler(async (req, res) => {
         bundles = bundles.map((b) => ({
           volumeInMB: b.volumeInMB || b.volume,
           volume: b.volume || b.volumeInMB + "MB",
-          price: parseFloat(b.price) || 0,
-          name: b.name || b.volume,
-          network: b.network || network,
           costPrice: parseFloat(b.price) || 0,
           price: applyProfit(parseFloat(b.price) || 0, b.volumeInMB || 0, network, settings),
+          name: b.name || b.volume,
+          network: b.network || network,
+          paystackFee: {
+            percentage: PAYSTACK_FEE_PERCENTAGE,
+            fixedFee: PAYSTACK_FIXED_FEE,
+            totalFee: Math.ceil((parseFloat(b.price) || 0) * (PAYSTACK_FEE_PERCENTAGE / 100) + PAYSTACK_FIXED_FEE) * 20 / 20
+          }
         }));
         
         return res.json({ 
           status: "success", 
           data: bundles, 
           count: bundles.length,
-          source: "remadata"
+          source: "remadata",
+          paystackFee: {
+            percentage: PAYSTACK_FEE_PERCENTAGE,
+            fixedFee: PAYSTACK_FIXED_FEE
+          }
         });
       }
     } catch (err) {
@@ -820,13 +871,22 @@ app.get("/api/bundles", asyncHandler(async (req, res) => {
     ...b,
     costPrice: b.price,
     price: applyProfit(b.price, b.volumeInMB, network, settings),
+    paystackFee: {
+      percentage: PAYSTACK_FEE_PERCENTAGE,
+      fixedFee: PAYSTACK_FIXED_FEE,
+      totalFee: Math.ceil((b.price) * (PAYSTACK_FEE_PERCENTAGE / 100) + PAYSTACK_FIXED_FEE) * 20 / 20
+    }
   }));
 
   res.json({ 
     status: "success", 
     data: bundles, 
     count: bundles.length,
-    source: "fallback"
+    source: "fallback",
+    paystackFee: {
+      percentage: PAYSTACK_FEE_PERCENTAGE,
+      fixedFee: PAYSTACK_FIXED_FEE
+    }
   });
 }));
 
@@ -1036,6 +1096,7 @@ ${col("║  CORS Allowed Origins", ALLOWED_ORIGINS.join(', '))}        ║
 ║  • 🛡️  Memory protection (${MAX_REF_SIZE} max refs)                        ║
 ║  • 📦 Firebase queue (${failedSaveQueue.length} pending)                    ║
 ║  • ⚡ Config injection for frontend                         ║
+║  • 💰 Paystack fees: ${PAYSTACK_FEE_PERCENTAGE}% + ₵${PAYSTACK_FIXED_FEE.toFixed(2)}           ║
 ╚══════════════════════════════════════════════════════════════╝`);
 });
 
