@@ -35,8 +35,7 @@ const PAYSTACK_PUBLIC_KEY = process.env.PAYSTACK_PUBLIC_KEY || "pk_live_ca0cb6cd
 //  PAYSTACK FEE CONFIGURATION
 // ─────────────────────────────────────────────
 
-const PAYSTACK_FEE_PERCENTAGE = 1.5; // 1.5% Paystack fee
-const PAYSTACK_FIXED_FEE = 0.50;     // ₵0.50 fixed fee per transaction
+const PAYSTACK_FEE_PERCENTAGE = 1.95; // 1.95% Paystack fee
 
 // ─────────────────────────────────────────────
 //  🔒 SECURE CORS - ONLY ALLOW YOUR DOMAIN
@@ -44,10 +43,10 @@ const PAYSTACK_FIXED_FEE = 0.50;     // ₵0.50 fixed fee per transaction
 
 // List of allowed origins (frontend domains)
 const ALLOWED_ORIGINS = [
-    'http://dataflow.kesug.com',  // Your frontend domain
+    'http://dataflow.kesug.com',
     'https://dataflow.kesug.com',
-    'http://localhost:3000',        // Local development
-    'http://localhost:5500',        // Local development (Live Server)
+    'http://localhost:3000',
+    'http://localhost:5500',
 ];
 
 // Add any additional domains from environment variable
@@ -58,12 +57,10 @@ console.log('🔒 CORS Allowed Origins:', ALLOWED_ORIGINS);
 
 const corsOptions = {
     origin: function(origin, callback) {
-        // Allow requests with no origin (like mobile apps, curl, server-to-server)
         if (!origin) {
             return callback(null, true);
         }
         
-        // Check if origin is allowed
         if (ALLOWED_ORIGINS.indexOf(origin) !== -1) {
             callback(null, true);
         } else {
@@ -74,10 +71,9 @@ const corsOptions = {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'X-API-Key'],
     credentials: true,
-    maxAge: 86400 // 24 hours
+    maxAge: 86400
 };
 
-// Use secure CORS
 app.use(cors(corsOptions));
 
 // ─────────────────────────────────────────────
@@ -177,6 +173,7 @@ const BUNDLE_DATA = {
     { volumeInMB: 4096, price: 17.70, name: "4GB" },
     { volumeInMB: 5120, price: 22.50, name: "5GB" },
     { volumeInMB: 6144, price: 26.30, name: "6GB" },
+    { volumeInMB: 8192, price: 32.50, name: "8GB" },
     { volumeInMB: 10240, price: 43.20, name: "10GB" },
     { volumeInMB: 15360, price: 63.20, name: "15GB" },
     { volumeInMB: 20480, price: 82.70, name: "20GB" },
@@ -187,31 +184,31 @@ const BUNDLE_DATA = {
     { volumeInMB: 102400, price: 437.70, name: "100GB" }
   ],
   telecel: [
-    { volumeInMB: 5120, price: 19.00, name: "5GB" },
-    { volumeInMB: 10240, price: 36.00, name: "10GB" },
-    { volumeInMB: 15360, price: 53.00, name: "15GB" },
-    { volumeInMB: 20480, price: 70.40, name: "20GB" },
-    { volumeInMB: 25600, price: 85.60, name: "25GB" },
-    { volumeInMB: 30720, price: 105.60, name: "30GB" },
-    { volumeInMB: 40960, price: 139.50, name: "40GB" },
-    { volumeInMB: 51200, price: 173.60, name: "50GB" },
-    { volumeInMB: 102400, price: 345.00, name: "100GB" }
+    { volumeInMB: 5120, price: 20.50, name: "5GB" },
+    { volumeInMB: 10240, price: 38.50, name: "10GB" },
+    { volumeInMB: 15360, price: 56.50, name: "15GB" },
+    { volumeInMB: 20480, price: 74.90, name: "20GB" },
+    { volumeInMB: 25600, price: 90.60, name: "25GB" },
+    { volumeInMB: 30720, price: 111.60, name: "30GB" },
+    { volumeInMB: 40960, price: 147.00, name: "40GB" },
+    { volumeInMB: 51200, price: 182.60, name: "50GB" },
+    { volumeInMB: 102400, price: 360.00, name: "100GB" }
   ],
   airteltigo: [
-    { volumeInMB: 1024, price: 4.20, name: "1GB" },
-    { volumeInMB: 2048, price: 8.00, name: "2GB" },
-    { volumeInMB: 3072, price: 12.59, name: "3GB" },
-    { volumeInMB: 4096, price: 15.80, name: "4GB" },
-    { volumeInMB: 5120, price: 16.71, name: "5GB" },
-    { volumeInMB: 6144, price: 23.00, name: "6GB" },
-    { volumeInMB: 7168, price: 27.00, name: "7GB" },
-    { volumeInMB: 8192, price: 30.20, name: "8GB" },
-    { volumeInMB: 10240, price: 38.50, name: "10GB" },
-    { volumeInMB: 12288, price: 47.50, name: "12GB" },
-    { volumeInMB: 15360, price: 58.40, name: "15GB" },
-    { volumeInMB: 20480, price: 77.80, name: "20GB" },
-    { volumeInMB: 25600, price: 98.50, name: "25GB" },
-    { volumeInMB: 30720, price: 115.50, name: "30GB" }
+    { volumeInMB: 1024, price: 4.70, name: "1GB" },
+    { volumeInMB: 2048, price: 8.80, name: "2GB" },
+    { volumeInMB: 3072, price: 13.59, name: "3GB" },
+    { volumeInMB: 4096, price: 17.00, name: "4GB" },
+    { volumeInMB: 5120, price: 18.21, name: "5GB" },
+    { volumeInMB: 6144, price: 24.80, name: "6GB" },
+    { volumeInMB: 7168, price: 29.00, name: "7GB" },
+    { volumeInMB: 8192, price: 32.40, name: "8GB" },
+    { volumeInMB: 10240, price: 41.00, name: "10GB" },
+    { volumeInMB: 12288, price: 50.50, name: "12GB" },
+    { volumeInMB: 15360, price: 61.90, name: "15GB" },
+    { volumeInMB: 20480, price: 82.30, name: "20GB" },
+    { volumeInMB: 25600, price: 103.50, name: "25GB" },
+    { volumeInMB: 30720, price: 121.50, name: "30GB" }
   ]
 };
 
@@ -296,7 +293,7 @@ function validateEnv() {
   
   console.log(`✅ Backend URL configured: ${BACKEND_URL}`);
   console.log(`🔒 CORS Allowed Origins: ${ALLOWED_ORIGINS.join(', ')}`);
-  console.log(`💰 Paystack fee: ${PAYSTACK_FEE_PERCENTAGE}% + ₵${PAYSTACK_FIXED_FEE.toFixed(2)}`);
+  console.log(`💰 Paystack fee: ${PAYSTACK_FEE_PERCENTAGE}%`);
 }
 
 // ─────────────────────────────────────────────
@@ -438,10 +435,8 @@ function requireApiKey(req, res, next) {
 //  SERVE FRONTEND WITH CONFIG INJECTION
 // ─────────────────────────────────────────────
 
-// Serve static files from public folder
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Main route - inject config into HTML
 app.get('/', (req, res) => {
     try {
         const indexPath = path.join(__dirname, 'public', 'index.html');
@@ -478,7 +473,6 @@ app.get('/', (req, res) => {
         
         let html = fs.readFileSync(indexPath, 'utf8');
         
-        // Inject the config
         const injectScript = `
         <script>
           window.__DF_CONFIG = {
@@ -564,7 +558,6 @@ function applyProfit(costPrice, volumeInMB, network, settings) {
   
   let basePrice = costPrice;
   
-  // Apply profit margin first
   if (mode === "percent") {
     const pct = parseFloat(percentAmount) || 0;
     basePrice = Math.ceil(costPrice * (1 + pct / 100) * 20) / 20;
@@ -577,9 +570,8 @@ function applyProfit(costPrice, volumeInMB, network, settings) {
     basePrice = Math.ceil((costPrice + flat) * 20) / 20;
   }
   
-  // 🔥 Add Paystack fees on top
-  // Paystack charges: 1.5% + ₵0.50 per transaction
-  const paystackFee = Math.ceil((basePrice * (PAYSTACK_FEE_PERCENTAGE / 100) + PAYSTACK_FIXED_FEE) * 20) / 20;
+  // Add Paystack fee on top
+  const paystackFee = Math.ceil((basePrice * (PAYSTACK_FEE_PERCENTAGE / 100)) * 20) / 20;
   const finalPrice = Math.ceil((basePrice + paystackFee) * 20) / 20;
   
   console.log(`💰 Fee breakdown: cost=${costPrice}, base=${basePrice}, fee=${paystackFee}, final=${finalPrice}`);
@@ -632,10 +624,21 @@ async function deliverViaRemaData(phone, networkType, volumeInMB, reference) {
     );
   }
 
-  const remaReference = response.data?.data?.reference || response.data?.reference || orderRef;
-  console.log(`✅ [RemaData] Delivered | Provider ref: ${remaReference}`);
+  // ✅ GET REMADATA'S REFERENCE FROM THE RESPONSE
+  const remaReference = response.data?.data?.reference || 
+                        response.data?.reference || 
+                        response.data?.data?.orderRef ||
+                        orderRef;
+  
+  console.log(`✅ [RemaData] Delivered | RemaData Ref: ${remaReference}`);
 
-  return { success: true, reference: remaReference, data: response.data, provider: "RemaData" };
+  return { 
+    success: true, 
+    remaRef: remaReference,
+    orderRef: orderRef,
+    data: response.data, 
+    provider: "RemaData" 
+  };
 }
 
 // ─────────────────────────────────────────────
@@ -701,40 +704,57 @@ app.post("/paystack/webhook", async (req, res) => {
   const phone = meta.phone || meta.customer_phone;
   const networkType = meta.networkType || meta.network_type;
   const volumeInMB = meta.volumeInMB || meta.volume_in_mb;
-  const ref = data.reference;
+  const paystackRef = data.reference;
   const amount = data.amount ? data.amount / 100 : 0;
 
-  const baseOrderData = { ref, phone, networkType, volumeInMB, amount, source: "paystack_webhook" };
+  const baseOrderData = { 
+    paystackRef,
+    phone, 
+    networkType, 
+    volumeInMB, 
+    amount, 
+    source: "paystack_webhook" 
+  };
 
   if (!phone || !volumeInMB || !networkType) {
     console.warn(`⚠️ Webhook: missing metadata — phone=${phone}, volume=${volumeInMB}, network=${networkType}`);
     return;
   }
 
-  if (processedRefs.has(ref)) {
-    console.warn(`⚠️ Webhook: duplicate ref ignored — ${ref}`);
+  if (processedRefs.has(paystackRef)) {
+    console.warn(`⚠️ Webhook: duplicate ref ignored — ${paystackRef}`);
     return;
   }
-  processedRefs.set(ref, Date.now());
+  processedRefs.set(paystackRef, Date.now());
 
   console.log(`💳 Webhook auto-delivery: ${networkType} ${volumeInMB}MB → ${phone}`);
 
   try {
-    const result = await deliverData(phone, networkType, Number(volumeInMB), ref);
+    const result = await deliverData(phone, networkType, Number(volumeInMB), paystackRef);
 
-    await saveOrderWithRetry(ref, {
-      ...baseOrderData,
+    // ✅ SAVE ORDER WITH REMADATA REFERENCE AS THE PRIMARY ID
+    const remaRef = result.remaRef;
+    
+    await saveOrderWithRetry(remaRef, {
+      orderId: remaRef,
+      remaDataRef: remaRef,
+      paystackRef: paystackRef,
+      phone: phone,
+      networkType: networkType,
+      volumeInMB: volumeInMB,
+      amount: amount,
       status: "completed",
       provider: result.provider,
-      providerRef: result.reference,
+      providerRef: remaRef,
       timestamp: new Date().toISOString(),
+      ...baseOrderData
     });
 
-    console.log(`✅ Webhook delivery complete | Provider: ${result.provider}`);
+    console.log(`✅ Webhook complete | RemaData Ref: ${remaRef}`);
   } catch (err) {
     console.error(`❌ Webhook delivery failed: ${err.message}`);
-    await saveFailedOrderWithRetry(ref, baseOrderData, err.message);
-    processedRefs.delete(ref);
+    await saveFailedOrderWithRetry(paystackRef, baseOrderData, err.message);
+    processedRefs.delete(paystackRef);
   }
 });
 
@@ -769,8 +789,7 @@ app.get("/health", (req, res) => {
     cors: ALLOWED_ORIGINS,
     paystackFee: {
       percentage: PAYSTACK_FEE_PERCENTAGE,
-      fixedFee: PAYSTACK_FIXED_FEE,
-      formula: `${PAYSTACK_FEE_PERCENTAGE}% + ₵${PAYSTACK_FIXED_FEE.toFixed(2)}`
+      formula: `${PAYSTACK_FEE_PERCENTAGE}%`
     }
   });
 });
@@ -798,11 +817,10 @@ app.get("/api/paystack-fee", (req, res) => {
   res.json({
     status: "success",
     percentage: PAYSTACK_FEE_PERCENTAGE,
-    fixedFee: PAYSTACK_FIXED_FEE,
-    formula: `${PAYSTACK_FEE_PERCENTAGE}% + ₵${PAYSTACK_FIXED_FEE.toFixed(2)} per transaction`,
+    formula: `${PAYSTACK_FEE_PERCENTAGE}% per transaction`,
     example: {
-      description: "For a ₵100 transaction, the Paystack fee would be:",
-      calculation: `(${PAYSTACK_FEE_PERCENTAGE}% × ₵100) + ₵${PAYSTACK_FIXED_FEE.toFixed(2)} = ₵${(100 * PAYSTACK_FEE_PERCENTAGE / 100 + PAYSTACK_FIXED_FEE).toFixed(2)}`
+      description: `For a ₵100 transaction, the Paystack fee would be:`,
+      calculation: `${PAYSTACK_FEE_PERCENTAGE}% × ₵100 = ₵${(100 * PAYSTACK_FEE_PERCENTAGE / 100).toFixed(2)}`
     }
   });
 });
@@ -836,8 +854,7 @@ app.get("/api/bundles", asyncHandler(async (req, res) => {
           network: b.network || network,
           paystackFee: {
             percentage: PAYSTACK_FEE_PERCENTAGE,
-            fixedFee: PAYSTACK_FIXED_FEE,
-            totalFee: Math.ceil((parseFloat(b.price) || 0) * (PAYSTACK_FEE_PERCENTAGE / 100) + PAYSTACK_FIXED_FEE) * 20 / 20
+            totalFee: Math.ceil((parseFloat(b.price) || 0) * (PAYSTACK_FEE_PERCENTAGE / 100)) * 20 / 20
           }
         }));
         
@@ -847,8 +864,7 @@ app.get("/api/bundles", asyncHandler(async (req, res) => {
           count: bundles.length,
           source: "remadata",
           paystackFee: {
-            percentage: PAYSTACK_FEE_PERCENTAGE,
-            fixedFee: PAYSTACK_FIXED_FEE
+            percentage: PAYSTACK_FEE_PERCENTAGE
           }
         });
       }
@@ -873,8 +889,7 @@ app.get("/api/bundles", asyncHandler(async (req, res) => {
     price: applyProfit(b.price, b.volumeInMB, network, settings),
     paystackFee: {
       percentage: PAYSTACK_FEE_PERCENTAGE,
-      fixedFee: PAYSTACK_FIXED_FEE,
-      totalFee: Math.ceil((b.price) * (PAYSTACK_FEE_PERCENTAGE / 100) + PAYSTACK_FIXED_FEE) * 20 / 20
+      totalFee: Math.ceil((b.price) * (PAYSTACK_FEE_PERCENTAGE / 100)) * 20 / 20
     }
   }));
 
@@ -884,8 +899,7 @@ app.get("/api/bundles", asyncHandler(async (req, res) => {
     count: bundles.length,
     source: "fallback",
     paystackFee: {
-      percentage: PAYSTACK_FEE_PERCENTAGE,
-      fixedFee: PAYSTACK_FIXED_FEE
+      percentage: PAYSTACK_FEE_PERCENTAGE
     }
   });
 }));
@@ -909,17 +923,18 @@ app.post("/deliver", requireApiKey, asyncHandler(async (req, res) => {
 
   const result = await deliverData(phone, networkType.toLowerCase(), volumeNum, ref);
 
-  console.log(`✅ Manual delivery complete | Provider: ${result.provider}`);
+  console.log(`✅ Manual delivery complete | RemaData Ref: ${result.remaRef}`);
   res.json({
     status: "success",
     provider: result.provider,
-    reference: result.reference,
+    remaRef: result.remaRef,
+    reference: result.remaRef,
     data: result.data,
   });
 }));
 
 // ─────────────────────────────────────────────
-//  ORDER STATUS LOOKUP
+//  ORDER STATUS LOOKUP - ONLY BY REMADATA REF
 // ─────────────────────────────────────────────
 
 app.get("/api/order-status/:reference", asyncHandler(async (req, res) => {
@@ -929,21 +944,44 @@ app.get("/api/order-status/:reference", asyncHandler(async (req, res) => {
     throw new AppError("Reference parameter is required", 400, "VALIDATION");
   }
 
-  // Check Firebase first
+  // ✅ ONLY search by RemaData reference in Firebase
   if (db) {
     try {
-      const snapshot = await db.ref('orders').orderByChild('orderId').equalTo(reference).once('value');
-      const data = snapshot.val();
+      // Try to find by remaDataRef (primary)
+      const snapshot = await db.ref('transactions')
+        .orderByChild('remaDataRef')
+        .equalTo(reference)
+        .once('value');
+      
+      let data = snapshot.val();
+      
+      // If not found, try by orderId
+      if (!data) {
+        const snapshot2 = await db.ref('transactions')
+          .orderByChild('orderId')
+          .equalTo(reference)
+          .once('value');
+        data = snapshot2.val();
+      }
+      
       if (data) {
         const order = Object.values(data)[0];
-        return res.json({ status: "success", source: "firebase", order: order });
+        return res.json({ 
+          status: "success", 
+          source: "firebase", 
+          order: {
+            ...order,
+            remaDataRef: order.remaDataRef || order.orderId,
+            paystackRef: order.paystackRef || null
+          }
+        });
       }
     } catch (err) {
       console.warn('Firebase lookup error:', err.message);
     }
   }
 
-  // Check RemaData
+  // ✅ Check RemaData directly using their reference
   if (!REMADATA_API_KEY) {
     throw new AppError("RemaData API not configured", 503, "CONFIGURATION");
   }
@@ -1096,7 +1134,8 @@ ${col("║  CORS Allowed Origins", ALLOWED_ORIGINS.join(', '))}        ║
 ║  • 🛡️  Memory protection (${MAX_REF_SIZE} max refs)                        ║
 ║  • 📦 Firebase queue (${failedSaveQueue.length} pending)                    ║
 ║  • ⚡ Config injection for frontend                         ║
-║  • 💰 Paystack fees: ${PAYSTACK_FEE_PERCENTAGE}% + ₵${PAYSTACK_FIXED_FEE.toFixed(2)}           ║
+║  • 💰 Paystack fees: ${PAYSTACK_FEE_PERCENTAGE}%                              ║
+║  • 🆔 RemaData reference used for tracking                 ║
 ╚══════════════════════════════════════════════════════════════╝`);
 });
 
